@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--raw", default="../data/raw/raw_long.csv", help="raw_long.csv")
+    ap.add_argument("--raw", default="../data/raw/data1000samples_test.csv", help="data1000samples_test.csv")
     ap.add_argument("--feat", default="../data/processed/train_features.csv", help="train_features.csv (must contain wave_id, settle_idx)")
     ap.add_argument("--wave", type=int, default=None, help="plot only this wave_id (optional)")
     ap.add_argument("--max-waves", type=int, default=6, help="max waves to plot")
@@ -17,10 +17,10 @@ def main():
     # checks
     for c in ["wave_id", "sample_idx", "current"]:
         if c not in raw.columns:
-            raise SystemExit(f"❌ raw_long.csv missing column: {c}")
+            raise SystemExit(f" data1000samples_test.csv missing column: {c}")
     for c in ["wave_id", "settle_idx"]:
         if c not in feat.columns:
-            raise SystemExit(f"❌ train_features.csv missing column: {c}")
+            raise SystemExit(f" train_features.csv missing column: {c}")
 
     raw = raw.sort_values(["wave_id", "sample_idx"])
 

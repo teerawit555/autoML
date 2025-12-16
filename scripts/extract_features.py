@@ -7,12 +7,10 @@ import sys
 import numpy as np
 import pandas as pd
 
-
 def _get_i_cols(df: pd.DataFrame) -> list[str]:
     i_cols = [c for c in df.columns if c.startswith("i_")]
     i_cols.sort(key=lambda s: int(s.split("_")[1]))
     return i_cols
-
 
 def compute_features_from_row(x: np.ndarray) -> dict:
     # x: shape (N,)
@@ -72,7 +70,6 @@ def compute_features_from_row(x: np.ndarray) -> dict:
         "band_3std_last": band,
     }
 
-
 def extract_features(in_path: str, out_path: str, label_col: str = "wait_time_ms") -> None:
     if not os.path.exists(in_path):
         raise FileNotFoundError(f'Input file not found: "{in_path}"')
@@ -91,9 +88,8 @@ def extract_features(in_path: str, out_path: str, label_col: str = "wait_time_ms
     out = pd.concat([df[keep_cols].reset_index(drop=True), feat_df], axis=1)
 
     out.to_csv(out_path, index=False)
-    print(f"✅ Wrote feature CSV: {out_path}")
+    print(f"Wrote feature CSV: {out_path}")
     print(f"   Rows: {len(out)} | i_cols: {len(i_cols)} | label_present: {label_col in out.columns}")
-
 
 def main():
     ap = argparse.ArgumentParser(description="Extract ML features from wide waveform CSV (i_0..i_N).")
@@ -105,7 +101,7 @@ def main():
     try:
         extract_features(args.in_path, args.out_path, label_col=args.label_col)
     except Exception as e:
-        print(f"❌ ERROR: {e}")
+        print(f"ERROR: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":

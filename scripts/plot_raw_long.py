@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--in", dest="in_path", default="../data/raw/raw_long.csv", help="input ../data/raw/raw_long.csv")
+    ap.add_argument("--in", dest="in_path", default="../data/raw/data1000samples_test.csv", help="input ../data/raw/data1000samples_test.csv")
     ap.add_argument("--wave", type=int, default=None, help="plot only this wave_id (optional)")
     ap.add_argument("--max-waves", type=int, default=6, help="max number of waves to plot (when --wave not set)")
     ap.add_argument("--save", default=None, help="save figure path (optional)")

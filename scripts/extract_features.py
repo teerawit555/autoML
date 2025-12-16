@@ -93,8 +93,8 @@ def extract_features(in_path: str, out_path: str, label_col: str = "wait_time_ms
 
 def main():
     ap = argparse.ArgumentParser(description="Extract ML features from wide waveform CSV (i_0..i_N).")
-    ap.add_argument("--in", dest="in_path", default="../data/processed/wide.csv", help="Input wide CSV (default: wide.csv)")
-    ap.add_argument("--out", dest="out_path", default="../data/processed/train_features.csv", help="Output CSV (default: train_features.csv)")
+    ap.add_argument("--in", dest="in_path", default="../data/processed/inference/wide.csv", help="Input wide CSV (default: wide.csv)")
+    ap.add_argument("--out", dest="out_path", default="../data/processed/train/train_features.csv", help="Output CSV (default: train_features.csv)")
     ap.add_argument("--label-col", default="wait_time_ms")
     args = ap.parse_args()
 

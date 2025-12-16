@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 def main():
     ap = argparse.ArgumentParser(description="Plot raw waveforms with predicted wait time.")
     ap.add_argument("--raw", default="../data/raw/data1000samples_test.csv", help="Path to the original long CSV (data1000samples_test.csv)")
-    ap.add_argument("--pred", default="../data/processed/predicted_wait_time_1000.csv", help="Path to the prediction CSV file (e.g., predicted_wait_time_1000.csv)")
+    ap.add_argument("--pred", default="../data/processed/prediction/predicted_wait_time_1000.csv", help="Path to the prediction CSV file (e.g., predicted_wait_time_1000.csv)")
     ap.add_argument("--out", default="../plots/waves/waves_with_pred_wait.png", help="Output path for the plot image")
     ap.add_argument("--ncols", type=int, default=4, help="Number of columns in the subplot grid")
     ap.add_argument("--sharey", action="store_true", help="Share Y-axis across all plots")
@@ -85,10 +85,10 @@ def main():
         fig.delaxes(axes[j])
 
     fig.supxlabel("time (ms)")
-    fig.supylabel("current (value)") # แก้ไข label
+    fig.supylabel("value") # แก้ไข label
     fig.tight_layout()
     fig.savefig(args.out, dpi=200)
-    print(f"✅ saved: {args.out}")
+    print(f"saved: {args.out}")
 
 if __name__ == "__main__":
     main()

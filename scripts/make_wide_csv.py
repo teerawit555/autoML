@@ -74,7 +74,7 @@ def main():
     ap = argparse.ArgumentParser(description="Convert long-format waveform CSV to wide-format (i_0..i_N).")
     # ปรับ Default Input และ Value Col
     ap.add_argument("--in", dest="in_path", default="../data/raw/data1000samples_test.csv", help="Input long CSV path (default: data1000samples_test.csv)")
-    ap.add_argument("--out", dest="out_path", default="../data/processed/wide.csv", help="Output wide CSV path (default: wide.csv)")
+    ap.add_argument("--out", dest="out_path", default="../data/processed/inference/wide.csv", help="Output wide CSV path (default: wide.csv)")
     ap.add_argument("--id-col", default="wave_id")
     ap.add_argument("--sample-idx-col", default="sample") 
     ap.add_argument("--value-col", default="value")

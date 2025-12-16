@@ -100,7 +100,7 @@ def train(
 
     out = df.copy()
     out["pred_wait_time_ms"] = preds
-    out.to_csv(f"data/processed/train_with_predictions_{ts}.csv", index=False)
+    out.to_csv(f"data/processed/train/train_with_predictions_{ts}.csv", index=False)
 
     # สรุปเป็นราย wave_id (เอาค่า pred ของแต่ละ wave_id)
     # ถ้า 1 wave_id มี 1 แถวอยู่แล้ว ผลจะตรงๆ
@@ -110,13 +110,13 @@ def train(
         .sort_values("wave_id")
     )
 
-    summary.to_csv(f"data/processed/pred_wait_by_wave_id_{ts}.csv", index=False)
+    summary.to_csv(f"data/processed/prediction/pred_wait_by_wave_id_{ts}.csv", index=False)
 
     print("\n=== Predicted wait_time_ms by wave_id ===")
     print(summary.to_string(index=False))
-    print("\n Saved file: data/processed/pred_wait_by_wave_id.csv")
+    print("\n Saved file: data/processed/prediction/pred_wait_by_wave_id.csv") # Result wave_id vs pred_wait_time_ms
 
-    print("\n Saved file: data/processed/train_with_predictions.csv")
+    print("\n Saved file: data/processed/train/train_with_predictions.csv")
     # print(out[["wait_time_ms", "pred_wait_time_ms"]].head(10))
     predictor.save()
     print("\n Done. Predictor saved at:", predictor.path)

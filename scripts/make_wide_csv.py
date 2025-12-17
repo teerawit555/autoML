@@ -110,7 +110,7 @@ def extract_features_and_label(group):
     # Add all your existing feature calculations here
     features = {
         'wave_id': group['wave_id'].iloc[0],
-        'time': times[0],                     # Start time
+        'time_ms': times[0],                     # Start time
         'sd': np.std(values),                 # Standard deviation (same as std_all)
         'low_limit': mean_last - tolerance,    # Dynamic low limit
         'high_limit': mean_last + tolerance,   # Dynamic high limit

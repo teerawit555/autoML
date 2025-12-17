@@ -22,27 +22,27 @@ def main():
     pred = pd.read_csv(args.pred)
 
     # --- sanity check columns ---
-    # แก้ไข: เปลี่ยน 'current' เป็น 'value'
+    # Edit: Changed 'current' to 'value'
     for c in ["wave_id", "time", "value"]:
         if c not in raw.columns:
-            # ใช้ 'time' แทน 'time_ms' (ตามโครงสร้างข้อมูลดิบที่คุณให้มา)
+            # Use 'time' instead of 'time_ms' (based on the provided raw data structure)
             raise ValueError(f"raw file missing column: {c}")
 
-    # ต้องมี wave_id + pred_wait_time_ms ใน pred
+    # Must contain 'wave_id' + 'pred_wait_time_ms' in pred
     if "pred_wait_time_ms" not in pred.columns:
         raise ValueError("pred file missing column: pred_wait_time_ms")
 
     if "wave_id" not in pred.columns:
-        raise ValueError("pred file missing column: wave_id (ดูหมายเหตุด้านล่าง)")
+        raise ValueError("pred file missing column: wave_id (see note below)")
 
-    # map predicted wait time ต่อ wave
-    # ใช้ค่าเฉลี่ยของ pred_wait_time_ms ต่อ wave_id หากมีหลายแถวต่อ wave
-    # (กรณี pred มาจาก train_with_predictions ซึ่งมีหลายแถวต่อ wave_id)
-    # แต่เนื่องจากไฟล์ทำนายมาจาก features.csv ซึ่งมี 1 แถวต่อ wave_id จึงใช้ .iloc[0]
+    # Map predicted wait time per wave
+    # Use average of pred_wait_time_ms per wave_id if there are multiple rows per wave
+    # (Case where pred comes from train_with_predictions which has multiple rows per wave_id)
+    # However, since the prediction file comes from features.csv which has 1 row per wave_id, we use .iloc[0]
     
-    # คำเตือน: ไฟล์ทำนาย (predicted_wait_time_1000.csv) มี 1 แถวต่อ wave_id อยู่แล้ว
-    # แต่ถ้าใช้ไฟล์ train_with_predictions.csv (จากโหมด train) จะมีหลายแถว
-    # เพื่อความปลอดภัย เราจะใช้ .iloc[0] เพราะไฟล์ features มี 1 แถวต่อ wave_id
+    # Warning: Prediction file (predicted_wait_time_1000.csv) already has 1 row per wave_id
+    # But if using train_with_predictions.csv (from train mode), there will be multiple rows
+    # For safety, we use .iloc[0] because features file has 1 row per wave_id
     pred_map = dict(zip(pred["wave_id"], pred["pred_wait_time_ms"]))
 
     wave_ids = sorted(raw["wave_id"].unique())
@@ -56,37 +56,39 @@ def main():
         sharex=True,
         sharey=args.sharey
     )
-    # จัดการกรณีมีแค่ 1 plot หรือมีหลาย plot
+    # Handle case with only 1 plot or multiple plots
     axes = axes.flatten() if n > 1 else [axes] if n == 1 else []
 
     for i, wid in enumerate(wave_ids):
         ax = axes[i]
-        sub = raw[raw["wave_id"] == wid].sort_values("time") # ใช้ "time"
-        
-        # แก้ไข: ใช้ "value" แทน "current"
-        ax.plot(sub["time"], sub["value"], linewidth=1)
+        sub = raw[raw["wave_id"] == wid].sort_values("time")
+
+         # Edit: Use "value" instead of "current" and add "Signal" label
+        ax.plot(sub["time"], sub["value"], linewidth=1, label='Signal')
         ax.set_title(f"wave_id={wid}")
 
-        # เส้น predicted wait
+        ax.set_xlabel("time (ms)", fontsize=9)
+        ax.set_ylabel("value", fontsize=9)
+
+        # Predicted wait line
         if wid in pred_map:
             t_pred = float(pred_map[wid])
-            ax.axvline(t_pred, linestyle="--", linewidth=1.5, color='r')
-            
-            # แก้ไข: ใช้ sub["value"].max()
-            ax.text(t_pred, sub["value"].max() * 0.95, f" pred={t_pred:.2f}ms",
-                     rotation=90, va="top", ha="left", fontsize=9, color='r')
+            ax.axvline(t_pred, color='orange', linestyle="--", linewidth=1.5, label='AI Predict')
+
+            # Edit: Changed "left" to "right"
+            ax.text(t_pred, sub["value"].max(), f" pred={t_pred:.2f}ms",
+                    rotation=90, va="top", ha="right", fontsize=9, color='r')
         else:
             ax.text(0.02, 0.90, "no pred", transform=ax.transAxes, fontsize=9)
 
         ax.grid(True, alpha=0.3)
 
-    # ลบ subplot ที่เหลือ (ถ้ามี)
+    # Remove remaining subplots (if any)
     for j in range(i + 1, len(axes)):
         fig.delaxes(axes[j])
-
-    fig.supxlabel("time (ms)")
-    fig.supylabel("value") # แก้ไข label
-    fig.tight_layout()
+        
+    # Edit: Added h_pad=3.0, w_pad=2.0 as parameters in tight_layout
+    fig.tight_layout(h_pad=3.0, w_pad=2.0) 
     fig.savefig(args.out, dpi=200)
     print(f"saved: {args.out}")
 

@@ -1,2 +1,4 @@
 # Python virtual environments
+AutogluonModels/
 venv311/
+__pycache__/

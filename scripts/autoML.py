@@ -63,6 +63,7 @@ def train(
         train_data=df,
         presets=presets,
         time_limit=time_limit,
+        num_gpus=1,
     )
 
     print("\n=== Leaderboard (val) ===")

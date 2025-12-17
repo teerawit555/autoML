@@ -34,7 +34,7 @@ python scripts\autoML.py --mode train --data data\processed\train\train_features
 python scripts\autoML.py --mode predict --model-path AutogluonModels --inference-csv data\processed\inference\train_features_1000_x.csv --out data\processed\prediction\predicted_wait_time_1000_x.csv
 
 # 6 plot
-python scripts\plot_waves.py --raw data\raw\data1000samples_test.csv --pred data\processed\prediction\predicted_wait_time_1000_x.csv --out plots\waves\waves_with_pred_wait_x.png
+python scripts\plot_all_waves.py --raw data\raw\data1000samples_test.csv --pred data\processed\prediction\predicted_wait_time_1000_x.csv --out plots\waves\waves_with_pred_wait_x.png
 
 # deactivate
 deactivate

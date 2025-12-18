@@ -78,7 +78,7 @@ def main():
 
         # กำหนด settle_time ให้ต่างกันตาม wave_id (ตัวอย่าง: 3ms..7ms)
         # คุณจะ map ตาม scenario จริงได้ทีหลัง
-        settle_time_ms = float(rng.choice([3.0, 3.5, 4.0, 4.7, 5.0, 5.5, 6.0, 6.5]))
+        settle_time_ms = float(rng.uniform(3.0, 7.0))
         if wave_id == 1:
             settle_time_ms = 3.0
         if wave_id == 2:
@@ -91,7 +91,7 @@ def main():
             sd=sd,
             low=low,
             high=high,
-            seed=1000 + wave_id
+            seed = 5000 + wave_id
         )
 
         for i, (tm, val) in enumerate(zip(t_ms, y)):

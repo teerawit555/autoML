@@ -29,8 +29,8 @@ pip install -r requirements.txt
 
 # 1. Generate synthetic data (1000 samples)
     #------ 1.1 Data for train ------#
-    python scripts\generate_raw_long.py --out data\raw\data_for_train.csv --dt_ms 0.01 --t_end_ms 9.99 --n_waves 100
-    #------ 1.2 Data for ,test ------#
+    python scripts\generate_train_sample.py --out data\raw\data_for_train.csv --dt_ms 0.01 --t_end_ms 9.99 --n_waves 100
+    #------ 1.2 Data for ,pred ------#
     python scripts\generate_predict_sample.py --out data\raw\data1000samples_test.csv --dt_ms 0.01 --t_end_ms 9.99 --n_waves 500
 
 # 2. Transform Long data to Wide format
@@ -49,4 +49,6 @@ python scripts\autoML.py --mode train --data data\processed\train\train_features
 python scripts\autoML.py --mode predict --model-path AutogluonModels/ag-20251217_144740 --inference-csv data\processed\inference\train_features_1000_x.csv --out data\processed\prediction\predicted_wait_time_1000_x.csv
 
 # 6. Generate Visualization plots
-python scripts\plot_all_waves.py --raw data\raw\data1000samples_test.csv --pred data\processed\prediction\predicted_wait_time_1000_x.csv --out plots\waves\waves_with_pred_wait_x.png
+python scripts\plot_all_waves.py --raw data\raw\data1000samples_test.csv --pred data\processed\prediction\predicted_wait_time_1000_x.csv --out plots\waves\pred_no_x_waves_with_pred_wait_x.png
+
+python scripts/plot_all_waves.py --raw data/raw/data1000samples_test_500.csv --pred data/processed/prediction/predicted_wait_time_10000_500wave.csv --actual data/processed/train/train_with_predictions_20251218_143759.csv --out plots/waves/test_no4_fix/final_comparison.png

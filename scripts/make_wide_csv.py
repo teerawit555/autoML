@@ -240,30 +240,50 @@ def compute_features_from_row(x: np.ndarray, N: int) -> dict:
     }
 
 def extract_features_and_label(group):
-    """ Used in Mode: Train (Process Long Data directly) """
+    """
+    Processes each wave_id group to:
+    1. Calculate automated settling time label (wait_time_ms)
+    2. Extract statistical waveform features
+    3. Return an ordered Series for the final CSV
+    """
     values = group['value'].values 
     times = group['time_ms'].values
     N = len(values)
     
-    # 1. Automated Label Calculation (Settling Time 1% Threshold)
-    last_10 = max(1, int(N * 0.1))
-    final_avg = np.mean(values[-last_10:])
+    # --- 1. SETTLING TIME CALCULATION (LABEL) ---
+    # Target value is the average of the last 10% of the signal
+    last_10_idx = max(1, int(N * 0.1))
+    final_avg = np.mean(values[-last_10_idx:])
+    
+    # Define tolerance band (±1% of the final average)
     tolerance = abs(final_avg * 0.01)
     
+    # Search backwards to find the last point outside the tolerance band
     settle_idx_label = N - 1
     for i in range(N - 1, -1, -1):
         if abs(values[i] - final_avg) > tolerance:
+            # The settling point is the sample immediately after the last exit
             settle_idx_label = i + 1
             break
+            
+    # Map index to actual timestamp (ms)
     wait_time_ms = times[min(settle_idx_label, len(times)-1)]
 
-    # 2. Extract Features (Reuse core logic)
-    feats = compute_features_from_row(values, N)
-    feats['wave_id'] = group['wave_id'].iloc[0]
-    feats['wait_time_ms'] = wait_time_ms
-    
-    return pd.Series(feats)
+    # --- 2. STATISTICAL FEATURE EXTRACTION ---
+    # Compute base features (x0, mean, slopes, ringing, etc.)
+    computed_features = compute_features_from_row(values, N)
 
+    # --- 3. CONSTRUCT ORDERED OUTPUT ---
+    # Place wave_id and wait_time_ms as the first two columns for readability
+    ordered_output = {
+        'wave_id': group['wave_id'].iloc[0],  # Primary Key
+        'wait_time_ms': wait_time_ms,         # Target Label
+    }
+    
+    # Append the rest of the calculated statistical features
+    ordered_output.update(computed_features)
+    
+    return pd.Series(ordered_output)
 def make_wide_plus_features(in_path, out_path, id_col, sample_col, value_col, label_col):
     """ Used in Mode: Inference (Pivot + Add Features) """
     df = pd.read_csv(in_path)
@@ -289,7 +309,7 @@ def make_wide_plus_features(in_path, out_path, id_col, sample_col, value_col, la
     final_df = pd.concat([wide, feat_df], axis=1)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     final_df.to_csv(out_path, index=False)
-    print(f"✅ Wide CSV with Features saved: {out_path}")
+    print(f" Wide CSV with Features saved: {out_path}")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -309,7 +329,7 @@ def main():
             train_features = df_raw.groupby(args.id_col, group_keys=False).apply(extract_features_and_label).reset_index(drop=True)
             os.makedirs(os.path.dirname(args.out_path), exist_ok=True)
             train_features.to_csv(args.out_path, index=False)
-            print(f"✅ Training features with labels saved: {args.out_path}")
+            print(f" Training features with labels saved: {args.out_path}")
         else:
             print(f"Processing Inference Data: {args.in_path}")
             make_wide_plus_features(args.in_path, args.out_path, args.id_col, args.sample_col, args.value_col, args.label_col)

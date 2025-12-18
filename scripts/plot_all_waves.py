@@ -1,96 +1,134 @@
-from pathlib import Path
 import argparse
 import math
 import pandas as pd
 import matplotlib.pyplot as plt
-
-# BASE_DIR = Path(__file__).resolve().parent.parent
-# RAW_DIR = BASE_DIR / "data" / "raw"
-# PROC_DIR = BASE_DIR / "data" / "processed"
-# PLOT_DIR = BASE_DIR / "plots" / "waves"
+from pathlib import Path
 
 def main():
-    ap = argparse.ArgumentParser(description="Plot raw waveforms with predicted wait time.")
-    ap.add_argument("--raw", default="../data/raw/data1000samples_test.csv", help="Path to the original long CSV (data1000samples_test.csv)")
-    ap.add_argument("--pred", default="../data/processed/prediction/predicted_wait_time_1000.csv", help="Path to the prediction CSV file (e.g., predicted_wait_time_1000.csv)")
-    ap.add_argument("--out", default="../plots/waves/waves_with_pred_wait.png", help="Output path for the plot image")
-    ap.add_argument("--ncols", type=int, default=4, help="Number of columns in the subplot grid")
-    ap.add_argument("--sharey", action="store_true", help="Share Y-axis across all plots")
+    ap = argparse.ArgumentParser(description="Plot waves with pagination and post-pred stats.")
+    ap.add_argument("--raw", required=True, help="Path to raw CSV")
+    ap.add_argument("--pred", required=True, help="Path to prediction CSV")
+    # ปรับ default output ให้ไปลงที่ plots/waves ตามที่ต้องการ
+    ap.add_argument("--out", default="plots/waves/result.png", help="Output filename (folders will be created automatically)")
+    ap.add_argument("--ncols", type=int, default=5, help="Columns per row")
+    ap.add_argument("--per_page", type=int, default=50, help="Number of waves per page")
     args = ap.parse_args()
 
+    # 1. โหลดข้อมูล
+    print(f"📂 Reading Raw: {args.raw}")
+    print(f"📂 Reading Pred: {args.pred}")
     raw = pd.read_csv(args.raw)
     pred = pd.read_csv(args.pred)
 
-    # --- sanity check columns ---
-    # Edit: Changed 'current' to 'value'
-    for c in ["wave_id", "time", "value"]:
-        if c not in raw.columns:
-            # Use 'time' instead of 'time_ms' (based on the provided raw data structure)
-            raise ValueError(f"raw file missing column: {c}")
-
-    # Must contain 'wave_id' + 'pred_wait_time_ms' in pred
-    if "pred_wait_time_ms" not in pred.columns:
-        raise ValueError("pred file missing column: pred_wait_time_ms")
-
-    if "wave_id" not in pred.columns:
-        raise ValueError("pred file missing column: wave_id (see note below)")
-
-    # Map predicted wait time per wave
-    # Use average of pred_wait_time_ms per wave_id if there are multiple rows per wave
-    # (Case where pred comes from train_with_predictions which has multiple rows per wave_id)
-    # However, since the prediction file comes from features.csv which has 1 row per wave_id, we use .iloc[0]
+    val_col = "value" if "value" in raw.columns else "current"
     
-    # Warning: Prediction file (predicted_wait_time_1000.csv) already has 1 row per wave_id
-    # But if using train_with_predictions.csv (from train mode), there will be multiple rows
-    # For safety, we use .iloc[0] because features file has 1 row per wave_id
+    # Map คำตอบ
     pred_map = dict(zip(pred["wave_id"], pred["pred_wait_time_ms"]))
+    all_wave_ids = sorted(raw["wave_id"].unique())
+    
+    total_waves = len(all_wave_ids)
+    per_page = args.per_page
+    num_pages = math.ceil(total_waves / per_page)
 
-    wave_ids = sorted(raw["wave_id"].unique())
-    n = len(wave_ids)
-    ncols = args.ncols
-    nrows = math.ceil(n / ncols)
+    print(f"📊 Total Waves: {total_waves}")
+    print(f"📄 Splitting into {num_pages} pages (Max {per_page} per page)")
 
-    fig, axes = plt.subplots(
-        nrows, ncols,
-        figsize=(4.5 * ncols, 3.2 * nrows),
-        sharex=True,
-        sharey=args.sharey
-    )
-    # Handle case with only 1 plot or multiple plots
-    axes = axes.flatten() if n > 1 else [axes] if n == 1 else []
-
-    for i, wid in enumerate(wave_ids):
-        ax = axes[i]
-        sub = raw[raw["wave_id"] == wid].sort_values("time")
-
-         # Edit: Use "value" instead of "current" and add "Signal" label
-        ax.plot(sub["time"], sub["value"], linewidth=1, label='Signal')
-        ax.set_title(f"wave_id={wid}")
-
-        ax.set_xlabel("time (ms)", fontsize=9)
-        ax.set_ylabel("value", fontsize=9)
-
-        # Predicted wait line
-        if wid in pred_map:
-            t_pred = float(pred_map[wid])
-            ax.axvline(t_pred, color='orange', linestyle="--", linewidth=1.5, label='AI Predict')
-
-            # Edit: Changed "left" to "right"
-            ax.text(t_pred, sub["value"].max(), f" pred={t_pred:.2f}ms",
-                    rotation=90, va="top", ha="right", fontsize=9, color='r')
-        else:
-            ax.text(0.02, 0.90, "no pred", transform=ax.transAxes, fontsize=9)
-
-        ax.grid(True, alpha=0.3)
-
-    # Remove remaining subplots (if any)
-    for j in range(i + 1, len(axes)):
-        fig.delaxes(axes[j])
+    # --- [ส่วนที่ 1] สร้าง Folder อัตโนมัติ ---
+    base_out_path = Path(args.out)
+    out_dir = base_out_path.parent  # ดึง path โฟลเดอร์จากชื่อไฟล์
+    
+    # สร้าง folder (เช่น plots/waves/...) ถ้ายังไม่มี
+    if not out_dir.exists():
+        print(f"📁 Creating directory: {out_dir}")
+        out_dir.mkdir(parents=True, exist_ok=True)
         
-    # Edit: Added h_pad=3.0, w_pad=2.0 as parameters in tight_layout
-    fig.tight_layout(h_pad=3.0, w_pad=2.0) 
-    fig.savefig(args.out, dpi=200)
-    print(f"saved: {args.out}")
+    stem_name = base_out_path.stem 
+
+    # 2. วนลูปสร้างกราฟ
+    for page in range(num_pages):
+        start_idx = page * per_page
+        end_idx = min(start_idx + per_page, total_waves)
+        batch_ids = all_wave_ids[start_idx:end_idx]
+        
+        n_batch = len(batch_ids)
+        ncols = args.ncols
+        nrows = math.ceil(n_batch / ncols)
+
+        fig, axes = plt.subplots(
+            nrows, ncols,
+            figsize=(4.0 * ncols, 3.0 * nrows),
+            sharex=True, sharey=True
+        )
+        
+        if n_batch > 1: axes = axes.flatten()
+        else: axes = [axes]
+
+        print(f"   🎨 Drawing Page {page + 1}/{num_pages} (Waves {start_idx+1}-{end_idx})...")
+
+        for i, wid in enumerate(batch_ids):
+            ax = axes[i]
+            sub = raw[raw["wave_id"] == wid].sort_values("time")
+            
+            # Plot เส้นสัญญาณหลัก
+            ax.plot(sub["time"], sub[val_col], linewidth=1, label='Signal', color='steelblue', alpha=0.8)
+            ax.set_title(f"ID={wid}", fontsize=10, fontweight='bold')
+            
+            # Plot เส้นทำนาย (Prediction Line)
+            if wid in pred_map:
+                t_pred = float(pred_map[wid])
+                
+                # วาดเส้นแนวตั้ง (เวลาที่ทำนาย)
+                ax.axvline(t_pred, color='orange', linestyle="--", linewidth=1.5)
+                
+                # --- [ส่วนที่ 2] คำนวณหา Max/Min หลังจากเวลา Prediction ---
+                # ตัดข้อมูลเอาเฉพาะช่วงเวลาหลังจาก t_pred เป็นต้นไป
+                post_data = sub[sub["time"] >= t_pred]
+                
+                if not post_data.empty:
+                    y_max = post_data[val_col].max()
+                    y_min = post_data[val_col].min()
+                    t_end = sub["time"].max()
+
+                    # วาดเส้นประแนวนอนบอกขอบเขต Max (สีเขียว) / Min (สีแดง)
+                    ax.hlines(y=y_max, xmin=t_pred, xmax=t_end, colors='green', linestyles=':', linewidth=1, alpha=0.7)
+                    ax.hlines(y=y_min, xmin=t_pred, xmax=t_end, colors='red', linestyles=':', linewidth=1, alpha=0.7)
+
+                    # ใส่ตัวเลข Max/Min โชว์ในกราฟ
+                    stats_text = f"Max: {y_max:.2f}\nPred: {t_pred:.2f}ms\nMin: {y_min:.2f}"
+                    
+                    # วางกล่องข้อความ (วางมุมขวาบน หรือตำแหน่งที่เหมาะสม)
+                    ax.text(0.95, 0.95, stats_text, 
+                            transform=ax.transAxes, # ใช้พิกัดเทียบกับกรอบรูป (0-1)
+                            fontsize=7, 
+                            color='black',
+                            ha='right', va='top',
+                            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="orange", alpha=0.8))
+                else:
+                    # กรณีทำนายเกินเวลากราฟ
+                    ax.text(t_pred, sub[val_col].max(), "Pred > End", fontsize=7, color='red')
+
+            else:
+                ax.text(0.5, 0.5, "No Pred", transform=ax.transAxes, ha='center', color='gray')
+
+            ax.grid(True, alpha=0.3)
+            
+            # Label แกน
+            if i >= (nrows - 1) * ncols: ax.set_xlabel("time (ms)", fontsize=8)
+            if i % ncols == 0: ax.set_ylabel("value", fontsize=8)
+
+        # ลบแกนเปล่าทิ้ง
+        for j in range(i + 1, len(axes)):
+            fig.delaxes(axes[j])
+
+        fig.tight_layout()
+        
+        save_name = f"{stem_name}_page{page + 1}.png"
+        save_path = out_dir / save_name
+        fig.savefig(save_path, dpi=150)
+        plt.close(fig)
+        print(f"      ✅ Saved: {save_path}")
+
+    print("\n✨ All plots saved successfully!")
 
 if __name__ == "__main__":
     main()

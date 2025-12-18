@@ -62,11 +62,7 @@ def train(
         train_data=df,
         presets=presets,
         time_limit=time_limit,
-<<<<<<< HEAD
         num_gpus=gpu_count, # Use GPU if detected
-=======
-        num_gpus=1,
->>>>>>> 20072a89275eb5c28971721d608936deff70fa3c
     )
 
     print("\n=== Leaderboard (val) ===")

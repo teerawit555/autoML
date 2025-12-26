@@ -204,39 +204,38 @@ import pandas as pd
 import numpy as np
 
 def compute_features_from_row(x: np.ndarray, N: int) -> dict:
-    """ Core logic from extract_features.py to calculate stats from a waveform array """
-    if N < 5: return {}
+    if N < 10: return {}
 
-    x0 = float(x[0])
+    # 1. ข้อมูลพื้นฐานที่ต้องมี
     x_end = float(x[-1])
-    mean_all = float(np.mean(x))
     std_all = float(np.std(x))
 
-    k = min(10, N)
-    last = x[-k:]
-    mean_last = float(np.mean(last))
-    std_last = float(np.std(last))
+    # 2. Tail Focus (50 points)
+    tail_50 = x[-min(N, 50):]
+    std_tail_50 = float(np.std(tail_50))
+    # หาค่าสูงสุดที่เบี่ยงเบนจากค่าสุดท้ายในช่วง 50 จุด
+    max_dev_tail_50 = float(np.max(np.abs(tail_50 - x_end)))
 
-    peak_rel = float(np.max(x) - mean_last)
-    trough_rel = float(mean_last - np.min(x))
+    # 3. Longer Tail Focus (150 points) - เพื่อดูแนวโน้มระยะยาว
+    tail_150 = x[-min(N, 150):]
+    std_tail_150 = float(np.std(tail_150))
+    
+    # Settling Trend: ถ้าค่านี้ > 1.2 แปลว่าสัญญาณกำลังลดระดับลงอย่างต่อเนื่อง
+    settling_trend = std_tail_150 / (std_tail_50 + 1e-9)
 
+    # 4. Ringing Energy (ห้ามตัด เพราะ Importance สูงสุด)
     dx = np.diff(x)
-    max_slope = float(np.max(dx))
-    min_slope = float(np.min(dx))
-    ringing_energy = float(np.sum(np.abs(dx[3:]))) if len(dx) > 3 else 0.0
-
-    band = max(3.0 * std_last, 1e-12)
-    settle_idx = N - 1
-    for i in range(N):
-        if np.all(np.abs(x[i:] - mean_last) <= band):
-            settle_idx = i
-            break
+    ringing_energy = float(np.sum(np.abs(dx[3:])))
 
     return {
-        "x0": x0, "x_end": x_end, "mean_all": mean_all, "std_all": std_all,
-        "mean_last": mean_last, "std_last": std_last, "peak_rel": peak_rel,
-        "trough_rel": trough_rel, "max_slope": max_slope, "min_slope": min_slope,
-        "ringing_energy": ringing_energy, "settle_idx": settle_idx, "band_3std_last": band,
+        "x_end": x_end,
+        "std_all": std_all,
+        "std_tail_50": std_tail_50,
+        "max_dev_tail_50": max_dev_tail_50, # เปลี่ยนจาก Diff เป็น Dev
+        "settling_trend": settling_trend,
+        "ringing_energy": ringing_energy,
+        "max_slope": float(np.max(dx)),
+        "stability_ratio": std_tail_50 / (std_all + 1e-9)
     }
 
 def extract_features_and_label(group):
@@ -246,27 +245,55 @@ def extract_features_and_label(group):
     2. Extract statistical waveform features
     3. Return an ordered Series for the final CSV
     """
+    # values = group['value'].values 
+    # times = group['time_ms'].values
+    # N = len(values)
+    
+    # # --- 1. SETTLING TIME CALCULATION (LABEL) ---
+    # # Target value is the average of the last 10% of the signal
+    # last_10_idx = max(1, int(N * 0.1))
+    # final_avg = np.mean(values[-last_10_idx:])
+    
+    # # Define tolerance band (±1% of the final average)
+    # tolerance = abs(final_avg * 0.01)
+    
+    # # Search backwards to find the last point outside the tolerance band
+    # settle_idx_label = N - 1
+    # for i in range(N - 1, -1, -1):
+    #     if abs(values[i] - final_avg) > tolerance:
+    #         # The settling point is the sample immediately after the last exit
+    #         settle_idx_label = i + 1
+    #         break
+            
+    # # Map index to actual timestamp (ms)
+    # wait_time_ms = times[min(settle_idx_label, len(times)-1)]
+
     values = group['value'].values 
     times = group['time_ms'].values
     N = len(values)
     
-    # --- 1. SETTLING TIME CALCULATION (LABEL) ---
-    # Target value is the average of the last 10% of the signal
-    last_10_idx = max(1, int(N * 0.1))
-    final_avg = np.mean(values[-last_10_idx:])
+    # 1. หาค่าเป้าหมายที่แท้จริง (อาจจะใช้ค่า Median แทน Mean เพื่อเลี่ยง Outlier)
+    final_target = np.median(values[-int(N*0.1):])
     
-    # Define tolerance band (±1% of the final average)
-    tolerance = abs(final_avg * 0.01)
+    # 2. คำนวณขอบเขต (Tolerance Band)
+    tolerance = abs(final_target * 0.01)
     
-    # Search backwards to find the last point outside the tolerance band
+    # 3. ROBUST SEARCH: หาจุดที่ "เข้าไปแล้วไม่กลับออกมาอีกเลย" (Steady State)
+    # และต้องนิ่งต่อเนื่องอย่างน้อย M samples
     settle_idx_label = N - 1
-    for i in range(N - 1, -1, -1):
-        if abs(values[i] - final_avg) > tolerance:
-            # The settling point is the sample immediately after the last exit
-            settle_idx_label = i + 1
+    M = 50 # จำนวน sample ที่ต้องนิ่งต่อเนื่องถึงจะยอมรับ
+    
+    for i in range(N - M, -1, -1):
+        # เช็คว่าในช่วง i ถึง i+M มีจุดไหนหลุด Band ไหม
+        window = values[i : i + M]
+        if np.any(np.abs(window - final_target) > tolerance):
+            # ถ้ามีหลุด แสดงว่าจุด Settling ต้องอยู่หลังจาก window นี้
+            settle_idx_label = i + M
             break
-            
-    # Map index to actual timestamp (ms)
+        else:
+            # ถ้านิ่งต่อเนื่อง ให้ขยับถอยหลังไปเรื่อยๆ เพื่อหาจุดเริ่มนิ่งที่แท้จริง
+            settle_idx_label = i
+
     wait_time_ms = times[min(settle_idx_label, len(times)-1)]
 
     # --- 2. STATISTICAL FEATURE EXTRACTION ---
@@ -284,32 +311,68 @@ def extract_features_and_label(group):
     ordered_output.update(computed_features)
     
     return pd.Series(ordered_output)
+# def make_wide_plus_features(in_path, out_path, id_col, sample_col, value_col, label_col):
+#     """ Used in Mode: Inference (Pivot + Add Features) """
+#     df = pd.read_csv(in_path)
+    
+#     # 1. Pivot to Wide (i_0...i_N)
+#     wide = df.pivot(index=id_col, columns=sample_col, values=value_col)
+#     wide.columns = [f"i_{int(c)}" for c in wide.columns]
+#     i_cols = sorted(list(wide.columns), key=lambda s: int(s.split("_")[1]))
+#     wide = wide[i_cols].reset_index()
+
+#     # 2. Attach Meta Columns
+#     meta_cols = [c for c in df.columns if c not in {id_col, sample_col, value_col, label_col}]
+#     if meta_cols:
+#         meta_df = df.groupby(id_col)[meta_cols].first().reset_index()
+#         wide = wide.merge(meta_df, on=id_col, how='left')
+
+#     # 3. Calculate Features from i_cols
+#     print("Calculating features for inference data...")
+#     X = wide[i_cols].to_numpy(dtype=float)
+#     feats_list = [compute_features_from_row(X[i], X.shape[1]) for i in range(X.shape[0])]
+#     feat_df = pd.DataFrame(feats_list)
+    
+#     final_df = pd.concat([wide, feat_df], axis=1)
+#     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+#     final_df.to_csv(out_path, index=False)
+#     print(f" Wide CSV with Features saved: {out_path}")
+
 def make_wide_plus_features(in_path, out_path, id_col, sample_col, value_col, label_col):
-    """ Used in Mode: Inference (Pivot + Add Features) """
+    """ ใช้สำหรับโหมด Inference: แปลงข้อมูลเป็น Wide และสกัดฟีเจอร์แบบทนทานต่อ NaN """
     df = pd.read_csv(in_path)
     
     # 1. Pivot to Wide (i_0...i_N)
     wide = df.pivot(index=id_col, columns=sample_col, values=value_col)
     wide.columns = [f"i_{int(c)}" for c in wide.columns]
     i_cols = sorted(list(wide.columns), key=lambda s: int(s.split("_")[1]))
-    wide = wide[i_cols].reset_index()
+    wide = wide.reset_index()
 
-    # 2. Attach Meta Columns
-    meta_cols = [c for c in df.columns if c not in {id_col, sample_col, value_col, label_col}]
+    # 2. Meta Columns
+    meta_exclude = {id_col, sample_col, value_col, label_col, 'time', 'time_ms'}
+    meta_cols = [c for c in df.columns if c not in meta_exclude]
     if meta_cols:
         meta_df = df.groupby(id_col)[meta_cols].first().reset_index()
         wide = wide.merge(meta_df, on=id_col, how='left')
 
-    # 3. Calculate Features from i_cols
-    print("Calculating features for inference data...")
-    X = wide[i_cols].to_numpy(dtype=float)
-    feats_list = [compute_features_from_row(X[i], X.shape[1]) for i in range(X.shape[0])]
-    feat_df = pd.DataFrame(feats_list)
+    # 3. Calculate Features per Wave
+    print(f"Calculating robust features for {len(wide)} waves...")
+    feats_list = []
+    for _, row in wide.iterrows():
+        # ลบ NaN ออกเพื่อให้ได้ waveform จริง (กรณี wave สั้นไม่เท่ากัน)
+        waveform = row[i_cols].dropna().to_numpy(dtype=float)
+        feat = compute_features_from_row(waveform, len(waveform))
+        feats_list.append(feat)
     
+    feat_df = pd.DataFrame(feats_list)
     final_df = pd.concat([wide, feat_df], axis=1)
+    
+    # เติม 0 ในส่วนข้อมูลดิบที่ว่างเพื่อให้ Model ไม่พัง
+    final_df[i_cols] = final_df[i_cols].fillna(0) 
+
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     final_df.to_csv(out_path, index=False)
-    print(f" Wide CSV with Features saved: {out_path}")
+    print(f"✅ Wide CSV with Robust Features saved: {out_path}")
 
 def main():
     ap = argparse.ArgumentParser()

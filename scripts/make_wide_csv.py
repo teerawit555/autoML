@@ -202,159 +202,251 @@ import os
 import sys
 import pandas as pd
 import numpy as np
-
+from scipy.signal import medfilt # เพิ่ม Library สำหรับกรองเข็มแหลม
+ 
 def compute_features_from_row(x: np.ndarray, N: int) -> dict:
-    if N < 10: return {}
+    if N < 50: return {}
 
-    # 1. ข้อมูลพื้นฐานที่ต้องมี
+    # --- 1. Global Scale & Basic Stats ---
     x_end = float(x[-1])
     std_all = float(np.std(x))
-
-    # 2. Tail Focus (50 points)
-    tail_50 = x[-min(N, 50):]
-    std_tail_50 = float(np.std(tail_50))
-    # หาค่าสูงสุดที่เบี่ยงเบนจากค่าสุดท้ายในช่วง 50 จุด
-    max_dev_tail_50 = float(np.max(np.abs(tail_50 - x_end)))
-
-    # 3. Longer Tail Focus (150 points) - เพื่อดูแนวโน้มระยะยาว
-    tail_150 = x[-min(N, 150):]
-    std_tail_150 = float(np.std(tail_150))
-    
-    # Settling Trend: ถ้าค่านี้ > 1.2 แปลว่าสัญญาณกำลังลดระดับลงอย่างต่อเนื่อง
-    settling_trend = std_tail_150 / (std_tail_50 + 1e-9)
-
-    # 4. Ringing Energy (ห้ามตัด เพราะ Importance สูงสุด)
     dx = np.diff(x)
     ringing_energy = float(np.sum(np.abs(dx[3:])))
+
+    # --- 2. Meso Scale (Rolling Window) ---
+    half_idx = N // 2
+    half_signal = x[half_idx:]
+    window_size = 100
+    if len(half_signal) > window_size:
+        windows = np.lib.stride_tricks.sliding_window_view(half_signal, window_size)
+        rolling_std = np.std(windows, axis=1)
+        max_rolling_std_half = float(np.max(rolling_std))
+    else:
+        max_rolling_std_half = std_all
+
+    # --- 3. Micro Scale (Tail) ---
+    tail_200 = x[-min(N, 200):]
+    tail_50 = x[-min(N, 50):]
+    std_tail_50 = float(np.std(tail_50))
+    max_dev_tail_50 = float(np.max(np.abs(tail_50 - x_end)))
+
+    # --- [NEW] 4. Special Features for Sine & Pulse ---
+    # Crossing Rate: บอก AI ว่าถ้าค่านี้สูง = Sine Wave (นิ่งแล้ว)
+    median_tail = np.median(tail_200)
+    zero_crossings = len(np.where(np.diff(np.sign(tail_200 - median_tail)))[0])
+    crossing_rate = zero_crossings / len(tail_200)
+
+    # Drift Score: เช็คว่ากราฟเอียงลงหรือไม่ (แยก Sine ออกจาก Slow Decay)
+    x_pd = pd.Series(x)
+    smooth_fast = x_pd.rolling(10).mean().bfill().values
+    smooth_slow = x_pd.rolling(50).mean().bfill().values
+    drift_score = float(np.mean(np.abs(smooth_fast[-100:] - smooth_slow[-100:])))
 
     return {
         "x_end": x_end,
         "std_all": std_all,
-        "std_tail_50": std_tail_50,
-        "max_dev_tail_50": max_dev_tail_50, # เปลี่ยนจาก Diff เป็น Dev
-        "settling_trend": settling_trend,
         "ringing_energy": ringing_energy,
-        "max_slope": float(np.max(dx)),
-        "stability_ratio": std_tail_50 / (std_all + 1e-9)
+        "max_rolling_std_half": max_rolling_std_half,
+        "std_tail_50": std_tail_50,
+        "max_dev_tail_50": max_dev_tail_50,
+        "mid_to_tail_ratio": max_rolling_std_half / (std_tail_50 + 1e-9),
+        "crossing_rate": crossing_rate,      # <--- Key Feature for Sine
+        "drift_score": drift_score,          # <--- Key Feature for Slope
+        "max_slope": float(np.max(dx))
     }
-
 def extract_features_and_label(group):
-    """
-    Processes each wave_id group to:
-    1. Calculate automated settling time label (wait_time_ms)
-    2. Extract statistical waveform features
-    3. Return an ordered Series for the final CSV
-    """
-    # values = group['value'].values 
-    # times = group['time_ms'].values
-    # N = len(values)
-    
-    # # --- 1. SETTLING TIME CALCULATION (LABEL) ---
-    # # Target value is the average of the last 10% of the signal
-    # last_10_idx = max(1, int(N * 0.1))
-    # final_avg = np.mean(values[-last_10_idx:])
-    
-    # # Define tolerance band (±1% of the final average)
-    # tolerance = abs(final_avg * 0.01)
-    
-    # # Search backwards to find the last point outside the tolerance band
-    # settle_idx_label = N - 1
-    # for i in range(N - 1, -1, -1):
-    #     if abs(values[i] - final_avg) > tolerance:
-    #         # The settling point is the sample immediately after the last exit
-    #         settle_idx_label = i + 1
-    #         break
-            
-    # # Map index to actual timestamp (ms)
-    # wait_time_ms = times[min(settle_idx_label, len(times)-1)]
-
     values = group['value'].values 
     times = group['time_ms'].values
     N = len(values)
     
-    # 1. หาค่าเป้าหมายที่แท้จริง (อาจจะใช้ค่า Median แทน Mean เพื่อเลี่ยง Outlier)
-    final_target = np.median(values[-int(N*0.1):])
+    # 1. เตรียมข้อมูล 2 ชุด (ทางใครทางมัน)
+    from scipy.signal import medfilt
     
-    # 2. คำนวณขอบเขต (Tolerance Band)
-    tolerance = abs(final_target * 0.01)
+    # [ชุด A] Light Filter: สำหรับตรวจ Ringing/Step (ต้องการความละเอียด)
+    clean_light = medfilt(values, kernel_size=3) 
     
-    # 3. ROBUST SEARCH: หาจุดที่ "เข้าไปแล้วไม่กลับออกมาอีกเลย" (Steady State)
-    # และต้องนิ่งต่อเนื่องอย่างน้อย M samples
-    settle_idx_label = N - 1
-    M = 50 # จำนวน sample ที่ต้องนิ่งต่อเนื่องถึงจะยอมรับ
+    # [ชุด B] Heavy Filter: สำหรับตรวจ Sine/Glitch (ต้องการความเรียบ)
+    # ใช้ Kernel ใหญ่ (51) เพื่อบดขยี้ Sine/Glitch ให้เป็นเส้นตรงกลาง
+    kernel_heavy = 51 if N > 51 else 11
+    clean_heavy = medfilt(values, kernel_size=kernel_heavy) 
     
-    for i in range(N - M, -1, -1):
-        # เช็คว่าในช่วง i ถึง i+M มีจุดไหนหลุด Band ไหม
-        window = values[i : i + M]
-        if np.any(np.abs(window - final_target) > tolerance):
-            # ถ้ามีหลุด แสดงว่าจุด Settling ต้องอยู่หลังจาก window นี้
-            settle_idx_label = i + M
-            break
+    # 2. วิเคราะห์หาง (Tail Analysis) เพื่อเลือกเส้นทาง
+    tail_len = int(N * 0.30)
+    if tail_len < 10: tail_len = 10
+    
+    tail_raw = values[-tail_len:]
+    tail_heavy = clean_heavy[-tail_len:]
+    
+    # คำนวณค่าสถิติ
+    heavy_amplitude = np.max(tail_heavy) - np.min(tail_heavy) # ความสูงของคลื่นหลัง Filter
+    heavy_target = np.median(tail_heavy)                      # Target ของชุด Heavy
+    
+    raw_target = np.median(tail_raw)                          # Target ของชุด Light/Raw
+    raw_sd = np.std(tail_raw)
+    
+    # --- [DECISION LOGIC] เลือกเส้นทาง ---
+    
+    # เช็คว่ากราฟยังแกว่งเป็นลอนคลื่นชัดเจนไหม (แม้จะโดน Heavy Filter แล้ว)
+    # ถ้าใช่ แสดงว่าเป็น Sine Wave หรือ Pulse ต่อเนื่อง -> บังคับ 0ms
+    is_continuous_wave = heavy_amplitude > (abs(heavy_target) * 0.015)
+    
+    if is_continuous_wave:
+        # [Path 1: Sine Wave / Continuous Pulse]
+        # ไม่ต้อง Search ให้เสียเวลา เพราะมันคือสภาวะปกติของคลื่นประเภทนี้
+        wait_time_ms = 0.0
+        
+    else:
+        # [Path 2: Ringing, Step, or Glitch] -> ต้องหาจุดนิ่ง
+        
+        # เช็คว่ามี Noise/Glitch เยอะไหม?
+        # ดูผลต่างระหว่าง Raw กับ Heavy (ถ้าต่างกันเยอะแสดงว่ามี Glitch/Noise)
+        noise_energy = np.mean(np.abs(tail_raw - tail_heavy))
+        is_noisy_or_glitchy = noise_energy > (abs(heavy_target) * 0.005)
+        
+        if is_noisy_or_glitchy:
+            # [Case: Glitch / Burst Noise] -> ใช้ Heavy Filter ตรวจ
+            search_values = clean_heavy
+            target = heavy_target # สำคัญ! ต้องใช้ Target ของ Heavy ให้ตรงกัน
+            
+            # Tolerance ขั้นต่ำ 1% (เผื่อรอยขรุขระจากการกรอง)
+            tolerance = max(abs(target * 0.01), 2 * np.std(tail_heavy))
+            
         else:
-            # ถ้านิ่งต่อเนื่อง ให้ขยับถอยหลังไปเรื่อยๆ เพื่อหาจุดเริ่มนิ่งที่แท้จริง
-            settle_idx_label = i
+            # [Case: Ringing / Step Response] -> ใช้ Light Filter ตรวจ
+            search_values = clean_light
+            target = raw_target   # ใช้ Target ของ Raw/Light
+            
+            # Tolerance เข้มงวด 1% หรือ 4 เท่าของ Noise พื้นฐาน
+            tail_sd_light = np.std(clean_light[-tail_len:])
+            tolerance = max(abs(target * 0.01), 4 * tail_sd_light)
 
-    wait_time_ms = times[min(settle_idx_label, len(times)-1)]
-
-    # --- 2. STATISTICAL FEATURE EXTRACTION ---
-    # Compute base features (x0, mean, slopes, ringing, etc.)
+        # --- Backward Search ---
+        settle_idx_label = 0
+        M = 50 
+        for i in range(N - M, -1, -1):
+            window = search_values[i : i + M]
+            if np.any(np.abs(window - target) > tolerance):
+                settle_idx_label = i + M
+                break
+        
+        wait_time_ms = times[min(settle_idx_label, len(times)-1)]
+    
+    # Features (เหมือนเดิม)
     computed_features = compute_features_from_row(values, N)
-
-    # --- 3. CONSTRUCT ORDERED OUTPUT ---
-    # Place wave_id and wait_time_ms as the first two columns for readability
-    ordered_output = {
-        'wave_id': group['wave_id'].iloc[0],  # Primary Key
-        'wait_time_ms': wait_time_ms,         # Target Label
-    }
     
-    # Append the rest of the calculated statistical features
-    ordered_output.update(computed_features)
-    
-    return pd.Series(ordered_output)
-# def make_wide_plus_features(in_path, out_path, id_col, sample_col, value_col, label_col):
-#     """ Used in Mode: Inference (Pivot + Add Features) """
-#     df = pd.read_csv(in_path)
-    
-#     # 1. Pivot to Wide (i_0...i_N)
-#     wide = df.pivot(index=id_col, columns=sample_col, values=value_col)
-#     wide.columns = [f"i_{int(c)}" for c in wide.columns]
-#     i_cols = sorted(list(wide.columns), key=lambda s: int(s.split("_")[1]))
-#     wide = wide[i_cols].reset_index()
+    return pd.Series({
+        'wave_id': group['wave_id'].iloc[0], 
+        'wait_time_ms': wait_time_ms, 
+        **computed_features
+    })
 
-#     # 2. Attach Meta Columns
-#     meta_cols = [c for c in df.columns if c not in {id_col, sample_col, value_col, label_col}]
-#     if meta_cols:
-#         meta_df = df.groupby(id_col)[meta_cols].first().reset_index()
-#         wide = wide.merge(meta_df, on=id_col, how='left')
-
-#     # 3. Calculate Features from i_cols
-#     print("Calculating features for inference data...")
-#     X = wide[i_cols].to_numpy(dtype=float)
-#     feats_list = [compute_features_from_row(X[i], X.shape[1]) for i in range(X.shape[0])]
-#     feat_df = pd.DataFrame(feats_list)
+# def extract_features_and_label(group):
     
-#     final_df = pd.concat([wide, feat_df], axis=1)
-#     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-#     final_df.to_csv(out_path, index=False)
-#     print(f" Wide CSV with Features saved: {out_path}")
+#     values = group['value'].values 
+#     times = group['time_ms'].values
+#     N = len(values)
+    
+#     # 1. กรองสัญญาณ (ใช้ Medfilt ลบ Spike)
+#     from scipy.signal import medfilt
+#     clean_values = medfilt(values, kernel_size=21)
+    
+#     # 2. วิเคราะห์หางกราฟ (Tail Analysis) เพื่อเลือกโหมด
+#     tail_len = int(N * 0.20) # ดู % สุดท้าย
+#     tail_values = values[-tail_len:]
+#     final_target = np.median(tail_values)
+#     tail_sd = np.std(tail_values)
+    
+#     # --- [NEW] DUAL-MODE LOGIC ---
+#     # ถ้า SD ของหางกราฟต่ำมาก (น้อยกว่า 0.5% ของค่าเป้าหมาย) แสดงว่าเป็นกราฟนิ่ง (Type 0, 1)
+#     # เราต้องใช้ Tolerance ที่แคบมากๆ เพื่อจับ Ringing
+#     is_precision_signal = tail_sd < (abs(final_target) * 0.005)
+    
+#     if is_precision_signal:
+#         # โหมดเข้มงวด: สำหรับกราฟ Ringing ทั่วไป (แก้ ID:91, 98)
+#         # บังคับให้นิ่งจริงๆ ที่ 1.5% ถึงจะยอม
+#         tolerance = max(abs(final_target * 0.015), 3 * tail_sd)
+#     else:
+#         # โหมดใจดี: สำหรับ Sine Wave และ Pulse (แก้ ID:81, 83)
+#         # ยอมให้แกว่งได้ตามธรรมชาติของมัน (6 sigma ครอบคลุม 99.7% ของการแกว่ง)
+#         tolerance = 6 * tail_sd
 
+#     # 3. Backward Search (เหมือนเดิม)
+#     settle_idx_label = 0
+#     M = 50 
+#     for i in range(N - M, -1, -1):
+#         window = clean_values[i : i + M]
+#         if np.any(np.abs(window - final_target) > tolerance):
+#             settle_idx_label = i + M
+#             break
+            
+#     wait_time_ms = times[min(settle_idx_label, len(times)-1)]
+    
+#     # ... (ส่วน feature extraction เหมือนเดิม) ...
+#     computed_features = compute_features_from_row(values, N)
+#     return pd.Series(
+#         {'wave_id': group['wave_id'].iloc[0]
+#          , 'wait_time_ms': wait_time_ms, **computed_features})
+
+#--- OLD VERSION ---
+
+    # values = group['value'].values 
+    # times = group['time_ms'].values
+    # N = len(values)
+    
+    # # --- [UPGRADE 1] Median Filter แรงๆ เพื่อลบ Spike และ Sine ---
+    # # ใช้ kernel=21 เพื่อรีดกราฟให้เป็นเส้นตรง (เฉพาะตอนทำเฉลย Label)
+    # clean_values = medfilt(values, kernel_size=21) 
+    
+    # # 1. หาค่าเป้าหมาย (Final Target)
+    # final_target = np.median(values[-int(N*0.1):])
+    
+    # # --- [UPGRADE 2] Tolerance กว้างขึ้น (Dynamic) ---
+    # # ใช้ 10% เพื่อยอมรับ Sine Wave ที่แกว่งแรงๆ ได้
+    # noise_sd = np.std(values[-int(N*0.1):])
+    # tolerance = max(abs(final_target * 0.15), 6 * noise_sd)
+    
+    # # 3. ROBUST BACKWARD SEARCH
+    # # หาจากหลังมาหน้า (Backward) ถ้าเจอจุดที่หลุด Band ให้หยุด
+    # settle_idx_label = 0
+    # M = 50 # ต้องนิ่งต่อเนื่อง 50 จุด
+    
+    # for i in range(N - M, -1, -1):
+    #     window = clean_values[i : i + M]
+    #     # ถ้าหน้าต่างนี้มีส่วนไหนหลุด Tolerance แสดงว่ายังไม่นิ่ง
+    #     if np.any(np.abs(window - final_target) > tolerance):
+    #         settle_idx_label = i + M
+    #         break
+            
+    # wait_time_ms = times[min(settle_idx_label, len(times)-1)]
+    
+    # # คำนวณ Features (ใช้ค่าดิบ values ส่งให้ AI)
+    # computed_features = compute_features_from_row(values, N)
+    
+    # ordered_output = {
+    #     'wave_id': group['wave_id'].iloc[0], 
+    #     'wait_time_ms': wait_time_ms, 
+    #     **computed_features
+    # }
+    
+    # return pd.Series(ordered_output)
+ 
 def make_wide_plus_features(in_path, out_path, id_col, sample_col, value_col, label_col):
     """ ใช้สำหรับโหมด Inference: แปลงข้อมูลเป็น Wide และสกัดฟีเจอร์แบบทนทานต่อ NaN """
     df = pd.read_csv(in_path)
-    
+   
     # 1. Pivot to Wide (i_0...i_N)
     wide = df.pivot(index=id_col, columns=sample_col, values=value_col)
     wide.columns = [f"i_{int(c)}" for c in wide.columns]
     i_cols = sorted(list(wide.columns), key=lambda s: int(s.split("_")[1]))
     wide = wide.reset_index()
-
+ 
     # 2. Meta Columns
     meta_exclude = {id_col, sample_col, value_col, label_col, 'time', 'time_ms'}
     meta_cols = [c for c in df.columns if c not in meta_exclude]
     if meta_cols:
         meta_df = df.groupby(id_col)[meta_cols].first().reset_index()
         wide = wide.merge(meta_df, on=id_col, how='left')
-
+ 
     # 3. Calculate Features per Wave
     print(f"Calculating robust features for {len(wide)} waves...")
     feats_list = []
@@ -363,17 +455,17 @@ def make_wide_plus_features(in_path, out_path, id_col, sample_col, value_col, la
         waveform = row[i_cols].dropna().to_numpy(dtype=float)
         feat = compute_features_from_row(waveform, len(waveform))
         feats_list.append(feat)
-    
+   
     feat_df = pd.DataFrame(feats_list)
     final_df = pd.concat([wide, feat_df], axis=1)
-    
+   
     # เติม 0 ในส่วนข้อมูลดิบที่ว่างเพื่อให้ Model ไม่พัง
-    final_df[i_cols] = final_df[i_cols].fillna(0) 
-
+    final_df[i_cols] = final_df[i_cols].fillna(0)
+ 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     final_df.to_csv(out_path, index=False)
     print(f"✅ Wide CSV with Robust Features saved: {out_path}")
-
+ 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="train", choices=["train", "inference"])
@@ -384,7 +476,7 @@ def main():
     ap.add_argument("--value-col", default="value")
     ap.add_argument("--label-col", default="wait_time_ms")
     args = ap.parse_args()
-
+ 
     try:
         if args.mode == "train":
             print(f"Processing Train Data: {args.in_path}")
@@ -399,6 +491,6 @@ def main():
     except Exception as e:
         print(f" ERROR: {e}")
         sys.exit(1)
-
+ 
 if __name__ == "__main__":
     main()

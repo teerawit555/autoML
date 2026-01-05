@@ -27,18 +27,25 @@ def train(
     df = pd.read_csv(data_path)
     
     # --- 1. PREPROCESSING ---
+    # [จุดที่แก้] สำรอง wave_id ไว้ก่อนที่จะถูก drop
+    wave_id_backup = df['wave_id'].copy() if 'wave_id' in df.columns else None
+
     cols_to_drop_found = [c for c in COLS_TO_DROP if c in df.columns]
     if cols_to_drop_found:
         print(f"Dropping meta columns: {cols_to_drop_found}")
-        df = df.drop(columns=cols_to_drop_found)
+        # เรา drop ออกจาก df ที่จะใช้เทรนเท่านั้น
+        df_train = df.drop(columns=cols_to_drop_found)
+    else:
+        df_train = df.copy()
 
-    df = df.dropna(subset=[label]).reset_index(drop=True)
+    df_train = df_train.dropna(subset=[label]).reset_index(drop=True)
     
     save_path = model_dir or DEFAULT_SAVE_PATH
     gpu_count = 1 if torch.cuda.is_available() else 0
     print(f"🚀 Training device: {'GPU (CUDA)' if gpu_count > 0 else 'CPU'}")
 
     # --- 2. FIT MODEL ---
+    # ใช้ df_train ในการ fit
     predictor = TabularPredictor(
         label=label,
         path=save_path,
@@ -46,55 +53,61 @@ def train(
         eval_metric="mean_absolute_error",
         verbosity=2,
     ).fit(
-        train_data=df,
+        train_data=df_train,
         presets=presets,
         time_limit=time_limit,
         num_gpus=gpu_count,
     )
 
-    # --- 3. MODEL ANALYSIS (ข้อมูลสำหรับ ADJUST MODEL) ---
+    # --- 3. MODEL ANALYSIS ---
     print("\n" + "="*60)
     print("🔍 DEEP MODEL ANALYSIS & DIAGNOSIS")
     print("="*60)
 
-    # A. Feature Importance: ดูว่า AI ใช้ฟีเจอร์ไหนตัดสินใจ (สำคัญมากในการ Adjust)
+    # A. Feature Importance
     print("\n[1] Calculating Feature Importance...")
-    importance = predictor.feature_importance(df)
-    print(importance.head(15)) # โชว์ 15 อันดับแรก
+    importance = predictor.feature_importance(df_train)
+    print(importance.head(15))
 
-    # B. Leaderboard: ดูว่าอัลกอริทึมตัวไหนฉลาดที่สุด
+    # B. Leaderboard
     print("\n[2] Model Leaderboard:")
-    leaderboard = predictor.leaderboard(df, silent=True)
+    leaderboard = predictor.leaderboard(df_train, silent=True)
     print(leaderboard[["model", "score_val", "pred_time_val", "fit_time"]].head(5))
 
-    # C. Residual Analysis: หาจุดที่ทายพลาด (Worst Case)
-    X_test = df.drop(columns=[label])
-    y_actual = df[label]
+    # C. Residual Analysis
+    X_test = df_train.drop(columns=[label])
+    y_actual = df_train[label]
     y_pred = predictor.predict(X_test)
 
-    out = df.copy()
+    # [จุดที่แก้] สร้าง DataFrame สำหรับ Report โดยเอา wave_id กลับมาใส่
+    out = df_train.copy()
+    if wave_id_backup is not None:
+        # ดึงเฉพาะ id ที่ตรงกับ index ของข้อมูลที่ใช้เทรน (กรณีมีการ dropna)
+        out["wave_id"] = wave_id_backup.iloc[df_train.index].values
+        
     out["pred_wait_time_ms"] = y_pred
     out["error_ms"] = out["pred_wait_time_ms"] - y_actual
     out["abs_error_ms"] = out["error_ms"].abs()
 
-    # ดึง 10 อันดับที่ AI ทายพลาดที่สุดมาโชว์
-    worst_10 = out.sort_values(by="abs_error_ms", ascending=False).head(10)
+    # [จุดที่แก้] ตรวจสอบคอลัมน์ก่อนพิมพ์ Worst 10
     print("\n[3] TOP 10 WORST PREDICTIONS (Review these Wave IDs!):")
-    print(worst_10[["wave_id", label, "pred_wait_time_ms", "error_ms"]])
+    cols_to_show = ["wave_id", label, "pred_wait_time_ms", "error_ms"]
+    # เช็คว่าถ้าไม่มี wave_id ใน out จริงๆ ให้ตัดออกจากลิสต์แสดงผลเพื่อไม่ให้พังอีก
+    cols_to_show = [c for c in cols_to_show if c in out.columns]
+    
+    worst_10 = out.sort_values(by="abs_error_ms", ascending=False).head(10)
+    print(worst_10[cols_to_show])
 
     # --- 4. SAVE DIAGNOSIS DATA ---
     os.makedirs("data/processed/analysis", exist_ok=True)
     os.makedirs("data/processed/train", exist_ok=True)
 
-    # ไฟล์ Diagnosis: รวม Features + Actual + Pred + Error (เอาไว้ Adjust ฟีเจอร์)
     diag_path = f"data/processed/analysis/diagnosis_report_{ts}.csv"
     out.to_csv(diag_path, index=False)
 
-    # ไฟล์ Feature Importance: เก็บไว้ดูว่าตัวไหนไม่มีประโยชน์จะได้ตัดออก
     feat_imp_path = f"data/processed/analysis/feature_importance_{ts}.csv"
     importance.to_csv(feat_imp_path)
 
-    # ไฟล์ผลลัพธ์ปกติ
     train_out_path = f"data/processed/train/train_with_predictions_{ts}.csv"
     out.drop(columns=["abs_error_ms"]).to_csv(train_out_path, index=False)
 
@@ -115,17 +128,28 @@ def predict(
     predictor = TabularPredictor.load(model_path)
     df = pd.read_csv(input_csv)
 
-    # Clean meta columns
-    for c in COLS_TO_DROP:
-        if c in df.columns:
-            df = df.drop(columns=[c])
+    # [จุดที่แก้] สำรอง wave_id ไว้ก่อน เพื่อเอาไว้แปะคืนในไฟล์ผลลัพธ์
+    wave_id_backup = df['wave_id'].copy() if 'wave_id' in df.columns else None
 
-    preds = predictor.predict(df)
-    out = df.copy()
+    # สร้าง DataFrame สำหรับส่งให้ AI ทาย (ต้องลบ meta columns และ ID ออก)
+    df_for_pred = df.copy()
+    for c in COLS_TO_DROP:
+        if c in df_for_pred.columns:
+            df_for_pred = df_for_pred.drop(columns=[c])
+
+    # AI ทำการทายผล
+    preds = predictor.predict(df_for_pred)
+    
+    # สร้าง DataFrame ผลลัพธ์
+    out = df_for_pred.copy()
+    if wave_id_backup is not None:
+        out["wave_id"] = wave_id_backup # เอา ID กลับคืนมา
+
     out["pred_wait_time_ms"] = preds
 
-    # Reorder columns ให้ ID และผลทายอยู่หน้าสุด
-    first_cols = ["wave_id", "pred_wait_time_ms"]
+    # Reorder columns ให้ ID และผลทายอยู่หน้าสุดเพื่อให้ดูง่าย
+    # ตรวจสอบก่อนว่ามีคอลัมน์ที่จะย้ายไหมป้องกัน Error ซ้ำ
+    first_cols = [c for c in ["wave_id", "pred_wait_time_ms"] if c in out.columns]
     other_cols = [c for c in out.columns if c not in first_cols]
     out = out[first_cols + other_cols]
 

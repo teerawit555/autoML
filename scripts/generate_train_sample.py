@@ -145,7 +145,7 @@ def generate_continuous_triangular_pulses(time_vector, target_value, settling_ti
 def generate_low_swing_sine_wave(time_vector, target_value, settling_time_s, limit_low, limit_high, random_gen):
     """ Type 3: Low Swing Sine Wave (Start at Center). """
     signal_array = np.full_like(time_vector, target_value)
-    freq_hz = random_gen.uniform(100, 300) 
+    freq_hz = random_gen.uniform(100, 350) 
     angular_freq = 2 * np.pi * freq_hz
     amplitude = (limit_high - limit_low) * random_gen.uniform(0.1, 0.25)
     

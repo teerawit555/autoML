@@ -21,7 +21,7 @@ def apply_cosine_taper_settling(signal_array, time_vector, settling_time_s, targ
     smoothed_signal = target_value + (deviation * fade_mask)
     return smoothed_signal
 
-def add_post_settle_noise(signal_array, time_vector, settling_time_s, target_value, random_gen, probability=0.5, smoothness=10):
+def add_post_settle_noise(signal_array, time_vector, settling_time_s, target_value, random_gen, probability=0.8, smoothness=100):
     """ 
     1. Adds Floor Noise (Always).
     2. Randomly decides whether to add extra continuous noise after settling.

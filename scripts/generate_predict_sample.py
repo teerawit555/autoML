@@ -1,114 +1,107 @@
-# scripts/generate_raw_long.py
+# scripts/generate_predict_sample.py
 import argparse
-import numpy as np
-import pandas as pd
 from pathlib import Path
 
-def make_wave(t, final_value, settle_time_ms, sd, low, high, seed=0):
-    """
-    สร้างรูปคลื่นแบบ: step -> overshoot+ringing (damped sine) -> เข้า band แล้วนิ่ง
-    """
-    rng = np.random.default_rng(seed)
+import numpy as np
+import pandas as pd
 
-    # ตั้งค่าให้คลื่นสั่นแรงช่วงแรก แล้ว decay
-    # amplitude เริ่มต้นให้สัมพันธ์กับ band width
-    band_half = (high - low) / 2.0
-    A0 = band_half * 8.0          # แรงสั่นช่วงแรก (ปรับได้)
-    freq_hz = 450                 # ความถี่สั่น (ปรับได้)
-    w = 2 * np.pi * freq_hz
+from generate_train_sample import (
+    generate_step_response,
+    generate_high_start_oscillation,
+    generate_continuous_triangular_pulses,
+    generate_low_swing_sine_wave,
+    generate_overdamped_decay,
+    generate_pulse_train,
+)
 
-    # decay ให้ประมาณ settle_time_ms แล้วเข้าช่วงนิ่ง
-    # exp(-t/tau) -> ที่ t=settle_time ให้เหลือ ~2% ของ A0
-    settle_s = settle_time_ms / 1000.0
-    tau = max(settle_s / 4.0, 1e-6)
 
-    # step response + ringing around final_value
-    # ใช้ (1 - exp(-t/ts)) ทำให้ขึ้นเร็ว แล้วมี ringing ทับ
-    ts = max(settle_s / 6.0, 1e-6)
-    base = final_value * (1 - np.exp(-t / ts))
+def build_generation_plan(n_waves: int, ratios, rng: np.random.Generator):
+    plan = []
+    allocated = 0
 
-    ringing = A0 * np.exp(-t / tau) * np.sin(w * t)
+    for func, r in ratios:
+        cnt = int(n_waves * float(r))
+        plan.extend([func] * cnt)
+        allocated += cnt
 
-    noise = rng.normal(0.0, sd, size=len(t))
+    remainder = n_waves - allocated
+    if remainder > 0:
+        plan.extend([ratios[0][0]] * remainder)
 
-    y = base + ringing + noise
+    rng.shuffle(plan)
+    return plan
 
-    # หลังจาก settle_time_ms: บังคับให้อยู่ใน band + noise เล็กน้อย
-    settled_mask = (t >= settle_s)
-    y[settled_mask] = final_value + rng.normal(0.0, sd * 0.25, size=settled_mask.sum())
-
-    return y
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="data/raw/raw_long.csv")
-    ap.add_argument("--n_waves", type=int, default=40)        #Edit: adjust default from 20 -> 40
-    ap.add_argument("--dt_ms", type=float, default=0.01)      #Edit: adjust default from 0.1 -> 0.01 for 1000 sample
-    ap.add_argument("--t_end_ms", type=float, default=9.9)   # 0.01->9.9 => 1000 samples
+    ap = argparse.ArgumentParser(description="Generate synthetic PREDICT waveform data (no labels).")
+    ap.add_argument("--out", default="data/raw/data_predict.csv")
+    ap.add_argument("--n_waves", type=int, default=200)
+    ap.add_argument("--dt_ms", type=float, default=0.01)
+    ap.add_argument("--t_end_ms", type=float, default=9.9)
+    ap.add_argument("--predict_noise_scale", type=float, default=0.6)
     args = ap.parse_args()
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # time axis
-    t_ms = np.arange(0, args.t_end_ms + 1e-12, args.dt_ms)
+    t_ms = np.arange(0.0, args.t_end_ms + 1e-12, args.dt_ms)
     t_s = t_ms / 1000.0
 
+    ratios = [
+        (generate_step_response,               0.25),  # Type 0
+        (generate_high_start_oscillation,      0.25),  # Type 1
+        (generate_overdamped_decay,            0.18),  # Type 4
+        (generate_pulse_train,                 0.14),  # Type 5
+        (generate_continuous_triangular_pulses,0.10),  # Type 2
+        (generate_low_swing_sine_wave,         0.08),  # Type 3
+    ]
+
+    master_rng = np.random.default_rng(20240107)
+    gen_sequence = build_generation_plan(args.n_waves, ratios, master_rng)
+
     rows = []
-    rng = np.random.default_rng(123)
+    print(f"Generating PREDICT dataset ({args.n_waves} waves)...")
 
-    for wave_id in range(1, args.n_waves + 1):
-        # สุ่ม "final value" และ band ให้ดูเหมือน tester
-        # ถ้าคุณอยาก fix แบบเดิม: wave_id1 ~3.05, wave_id2 ~1.05, wave_id3 ~1.80 ...
-        if wave_id == 1:
-            final_value = 3.05
-            low, high = 2.95, 3.15
-        elif wave_id == 2:
-            final_value = 1.05
-            low, high = 0.95, 1.15
-        elif wave_id == 3:
-            final_value = 1.80
-            low, high = 1.75, 1.85
-        else:
-            final_value = rng.uniform(0.8, 3.2)
-            band = rng.uniform(0.10, 0.25)
-            low, high = final_value - band/2, final_value + band/2
+    for wave_id, gen_func in enumerate(gen_sequence, start=1):
+        # ---- waveform-level parameters ----
+        final_value = float(master_rng.uniform(0.5, 3.5))
+        band_pct = float(master_rng.uniform(0.05, 0.15))
+        band = final_value * band_pct
 
-        sd = 0.01
+        low = final_value - band / 2.0
+        high = final_value + band / 2.0
 
-        # กำหนด settle_time ให้ต่างกันตาม wave_id (ตัวอย่าง: 3ms..7ms)
-        # คุณจะ map ตาม scenario จริงได้ทีหลัง
-        settle_time_ms = float(rng.uniform(3.0, 7.0))
-        if wave_id == 1:
-            settle_time_ms = 3.0
-        if wave_id == 2:
-            settle_time_ms = 5.0
+        settle_time_ms = float(master_rng.uniform(2.0, 8.0))
+        settle_s = settle_time_ms / 1000.0
 
-        y = make_wave(
-            t=t_s,
-            final_value=final_value,
-            settle_time_ms=settle_time_ms,
-            sd=sd,
-            low=low,
-            high=high,
-            seed = 5000 + wave_id
+        wave_rng = np.random.default_rng(500000 + wave_id)
+
+        y, used_sd, _, _ = gen_func(
+            t_s, final_value, settle_s, low, high, wave_rng
         )
 
+        # ---- predict-only disturbance ----
+        extra_rng = np.random.default_rng(900000 + wave_id)
+        extra_sd = max(float(used_sd) * args.predict_noise_scale, 1e-6)
+        y = y + extra_rng.normal(0.0, extra_sd, size=len(y))
+
+        # ---- export ----
         for i, (tm, val) in enumerate(zip(t_ms, y)):
-            rows.append({
+            row = {
                 "wave_id": wave_id,
                 "sample": i,
-                "time": float(tm),
+                "time_ms": float(tm),
                 "value": float(val),
-                "sd": float(sd),
                 "low_limit": float(low),
                 "high_limit": float(high),
-            })
+            }
 
-    df = pd.DataFrame(rows)
-    df.to_csv(out_path, index=False)
-    print(f"✅ Wrote: {out_path}  (rows={len(df)})")
+
+            rows.append(row)
+
+    pd.DataFrame(rows).to_csv(out_path, index=False)
+    print(f"Saved PREDICT data to: {out_path}")
+
 
 if __name__ == "__main__":
     main()
-    

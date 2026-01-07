@@ -370,34 +370,36 @@ def generate_overdamped_decay(time_vector, target_value, settling_time_s, limit_
 
 def generate_pulse_train(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
     """
-    Type 5: Steady baseline + square pulses (no settling).
+    Type 5: Steady baseline + POSITIVE square pulses (no settling).
     - Baseline stays near target_value for the whole record.
     - Pulses occur periodically; amplitude can be high or low.
+    - Per-pulse amplitude varies, with chance to repeat previous amplitude.
+    - Guarantees at least 1 pulse in the record.
     """
     y = np.full_like(time_vector, target_value, dtype=float)
     band = float(limit_high - limit_low)
 
     # --- choose "style" per waveform: high or low amplitude ---
-    # (คุณปรับ ratio ได้)
     if rng.random() < 0.35:
         amp_scale = rng.uniform(1.2, 2.5)   # high pulses
     else:
         amp_scale = rng.uniform(0.25, 1.1)  # low/medium pulses
 
-    # amplitude relative to band (positive or negative pulses)
-    pulse_amp = band * amp_scale
+    base_amp = band * amp_scale  # ✅ base amplitude ต่อ waveform (positive)
 
     # --- period & duty ---
-    # ให้คาบอยู่ระดับ "หลายๆ pulse ภายใน record" (ปรับช่วงได้)
     t_end = float(time_vector[-1])
-    period = rng.uniform(t_end / 5.0, t_end / 2)  # ~3-10 pulses per record
-    duty = rng.uniform(0.08, 0.2)               # width = duty*period
-
-    # optional jitter per pulse (เล็กน้อย)
+    period = rng.uniform(t_end / 5.0, t_end / 2.0)   # คาบยาวขึ้น
+    duty = rng.uniform(0.08, 0.20)                  # pulse แคบ
     jitter_frac = rng.uniform(0.00, 0.08)
 
     # start offset
     current_time = rng.uniform(0.0, period * 0.6)
+
+    # amplitude repeat probability
+    p_same = 0.35
+    prev_amp = None
+    has_pulse = False
 
     while current_time < t_end:
         this_period = period * rng.uniform(1.0 - jitter_frac, 1.0 + jitter_frac)
@@ -408,18 +410,35 @@ def generate_pulse_train(time_vector, target_value, settling_time_s, limit_low, 
 
         mask = (time_vector >= t_start) & (time_vector < t_stop)
         if np.any(mask):
-            y[mask] += pulse_amp
+            has_pulse = True
+
+            # decide this pulse amplitude
+            if (prev_amp is not None) and (rng.random() < p_same):
+                this_amp = prev_amp
+            else:
+                this_amp = base_amp * rng.uniform(0.4, 1.6)  # สุ่มใหม่ต่อ pulse
+                prev_amp = this_amp
+
+            # ✅ IMPORTANT: actually add pulse to signal
+            y[mask] += this_amp
 
         current_time += this_period
 
-    # --- add only "family floor noise" (no post-settle wiggle) ---
+    # Guarantee at least one pulse
+    if not has_pulse:
+        t_mid = 0.5 * t_end
+        width = 0.05 * t_end
+        mask = (time_vector >= t_mid) & (time_vector < t_mid + width)
+        y[mask] += base_amp
+
+    # add only "family floor noise" (no post-settle wiggle)
     y, sd = add_post_settle_noise(
         y, time_vector,
-        settling_time_s=0.0,        # no settle
+        settling_time_s=0.0,
         target_value=target_value,
         rng=rng,
-        probability=0.0,            # disable post-settle wiggle
-        add_wobble_prob=0.0,        # disable wobble
+        probability=0.0,
+        add_wobble_prob=0.0,
     )
 
     return y, sd, "type5_Square_Pulse_Train", 0.0, 1
@@ -514,9 +533,7 @@ def main():
                 "value": float(val),
                 "sd": float(used_sd),
                 "low_limit": float(low),
-                "high_limit": float(high),
-                "true_settle_ms": float(true_settle_ms),
-                "true_is_zero": int(true_is_zero),      
+                "high_limit": float(high),    
             })
 
     df = pd.DataFrame(rows)

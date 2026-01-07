@@ -3,7 +3,7 @@ import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
-
+ 
 # ==========================================
 # 1. Helper Functions (Utilities)
 # ==========================================
@@ -106,9 +106,9 @@ def add_quantization(y, rng, q_step_frac=0.0005):
     return np.round(y / q) * q
 
 # ==========================================
-# 2. Signal Generator Functions
+# 2. Signal Generator Functions (Refactored Names)
 # ==========================================
-
+ 
 def generate_step_response(time_vector, target_value, settling_time_s, limit_low, limit_high, random_gen):
     """ Type 0: Standard Step Response (more realistic post-settle) """
     freq_hz = random_gen.uniform(100, 1200)
@@ -125,7 +125,7 @@ def generate_step_response(time_vector, target_value, settling_time_s, limit_low
 
     decay_factor = random_gen.uniform(2.5, 6.0)
     tau = max(settling_time_s / decay_factor, 1e-6)
-
+ 
     rise_factor = random_gen.uniform(3.0, 10.0)
     time_constant_rise = max(settling_time_s / rise_factor, 1e-6)
 
@@ -289,30 +289,50 @@ def generate_high_start_oscillation(time_vector, target_value, settling_time_s, 
 
 
 def generate_continuous_triangular_pulses(time_vector, target_value, settling_time_s, limit_low, limit_high, random_gen):
-    """ Type 2: Continuous Triangular Pulse Train. """
+    """
+    Type 2: Continuous Triangular Pulse Train.
+    Generates continuous triangular pulses with variable or constant Height/Period.
+    (No noise, continuous signal).
+    """
     signal_array = np.full_like(time_vector, target_value)
+    # Configuration flags
     is_height_const = random_gen.choice([True, False])
     is_period_const = random_gen.choice([True, False])
-
+    subtype_str = f"type2_tri_H{'const' if is_height_const else 'var'}_T{'const' if is_period_const else 'var'}"
+ 
+    # Parameters
     avg_height = (limit_high - limit_low) * random_gen.uniform(0.5, 1.5)
     avg_period = random_gen.uniform(settling_time_s / 3.0, settling_time_s / 1.5)
-    pulse_width = avg_period * random_gen.uniform(0.15, 0.3) 
+    pulse_width = avg_period * random_gen.uniform(0.15, 0.3)
+ 
     current_time = random_gen.uniform(0, avg_period * 0.3)
-
+ 
     while current_time < time_vector[-1]:
-        if is_height_const: height = avg_height
-        else: height = avg_height * random_gen.uniform(0.5, 1.5)
-
-        t_start, t_peak, t_end = current_time, current_time + pulse_width / 2, current_time + pulse_width
-        
+        # Determine Height
+        if is_height_const:
+            height = avg_height
+        else:
+            height = avg_height * random_gen.uniform(0.5, 1.5)
+ 
+        # Draw Triangle
+        t_start = current_time
+        t_peak = current_time + pulse_width / 2
+        t_end = current_time + pulse_width
+ 
+        # Rise phase
         mask_rise = (time_vector >= t_start) & (time_vector < t_peak)
-        if np.any(mask_rise): signal_array[mask_rise] += (height / (pulse_width/2)) * (time_vector[mask_rise] - t_start)
-            
+        if np.any(mask_rise):
+            signal_array[mask_rise] += (height / (pulse_width/2)) * (time_vector[mask_rise] - t_start)
+        # Fall phase
         mask_fall = (time_vector >= t_peak) & (time_vector < t_end)
-        if np.any(mask_fall): signal_array[mask_fall] += height - (height / (pulse_width/2)) * (time_vector[mask_fall] - t_peak)
-
-        if is_period_const: period = avg_period
-        else: period = avg_period * random_gen.uniform(0.7, 1.3)
+        if np.any(mask_fall):
+            signal_array[mask_fall] += height - (height / (pulse_width/2)) * (time_vector[mask_fall] - t_peak)
+ 
+        # Determine next Period
+        if is_period_const:
+            period = avg_period
+        else:
+            period = avg_period * random_gen.uniform(0.7, 1.3)
         current_time += period
     
     noise_level_pct = random_gen.uniform(0.00005, 0.0002)
@@ -323,18 +343,21 @@ def generate_continuous_triangular_pulses(time_vector, target_value, settling_ti
 
 
 def generate_low_swing_sine_wave(time_vector, target_value, settling_time_s, limit_low, limit_high, random_gen):
-    """ Type 3: Low Swing Sine Wave (Start at Center). """
+    """
+    Type 3: Low Swing Sine Wave (Sea Wave).
+    Generates a continuous sine wave with low amplitude and very low noise.
+    """
     signal_array = np.full_like(time_vector, target_value)
     freq_hz = random_gen.uniform(200, 500) 
     angular_freq = 2 * np.pi * freq_hz
+    # Amplitude: Low swing
     amplitude = (limit_high - limit_low) * random_gen.uniform(0.1, 0.25)
-    
-    # Phase shift: 0 or PI to start at center
-    phase = random_gen.choice([0.0, np.pi])
-    
+    # Phase shift
+    phase = random_gen.uniform(0, 2 * np.pi)
+    # Generate Base Wave
     oscillation = amplitude * np.sin(angular_freq * time_vector + phase)
     signal_array += oscillation
-    
+    # Add Noise (0-0.002%)
     noise_level_pct = random_gen.uniform(0.0, 0.00002)
     sd_noise = max(target_value * noise_level_pct, 1e-6)
     signal_array += random_gen.normal(0.0, sd_noise, size=len(time_vector))
@@ -445,9 +468,9 @@ def generate_pulse_train(time_vector, target_value, settling_time_s, limit_low, 
 
 
 # ==========================================
-# 3. Main Script
+# 3. Main Script (Standard Structure)
 # ==========================================
-
+ 
 def main():
     ap = argparse.ArgumentParser(description="Generate synthetic TRAINING waveform data.")
     ap.add_argument("--out", default="data/raw/data1000samples_train.csv", help="Output CSV path")
@@ -455,17 +478,17 @@ def main():
     ap.add_argument("--dt_ms", type=float, default=0.01, help="Time step in milliseconds")
     ap.add_argument("--t_end_ms", type=float, default=9.9, help="End time in milliseconds")
     args = ap.parse_args()
-
+ 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-
+ 
     t_ms = np.arange(0, args.t_end_ms + 1e-12, args.dt_ms)
     t_s = t_ms / 1000.0
-
+ 
     rows = []
-    master_rng = np.random.default_rng(12345) 
-
-    # [UPDATED] Added Type 4 to the list
+    master_rng = np.random.default_rng(12345)
+ 
+    # Update list with new formal function names
     signal_generators = [
     generate_step_response,
     generate_high_start_oscillation,
@@ -513,21 +536,19 @@ def main():
         band_pct = master_rng.uniform(0.05, 0.15)
         band = final_value * band_pct
         low, high = final_value - band/2, final_value + band/2
-        
         settle_time_ms = master_rng.uniform(2.0, 8.0)
         settle_s = settle_time_ms / 1000.0
-
-        gen_func = shuffled_gens[wave_id - 1]
+ 
+        gen_func = master_rng.choice(signal_generators)
         wave_rng = np.random.default_rng(100000 + wave_id)
 
         y, used_sd, type_name, true_settle_ms, true_is_zero = gen_func(
             t_s, final_value, settle_s, low, high, wave_rng
         )
-
+ 
         for i, (tm, val) in enumerate(zip(t_ms, y)):
             rows.append({
                 "wave_id": wave_id,
-                "type": type_name,
                 "sample": i,
                 "time_ms": float(tm),
                 "value": float(val),
@@ -535,10 +556,19 @@ def main():
                 "low_limit": float(low),
                 "high_limit": float(high),    
             })
-
+ 
     df = pd.DataFrame(rows)
     df.to_csv(out_path, index=False)
     print(f"Successfully saved TRAINING data to: {out_path}")
-
+    print(f"Total rows generated: {len(df)}")
+    print("Distribution:", df.groupby('wave_id')['signal_type'].first().value_counts())
+ 
 if __name__ == "__main__":
     main()
+
+
+ 
+ 
+ 
+ 
+ 

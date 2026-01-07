@@ -2,7 +2,10 @@ import argparse
 import math
 import pandas as pd
 import matplotlib.pyplot as plt
+import numpy as np
+from scipy.signal import medfilt
 from pathlib import Path
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -11,6 +14,7 @@ def main():
     ap.add_argument("--raw", required=True, help="Path to raw CSV (data_for_train.csv หรือ data1000samples_test_2.csv)")
     ap.add_argument("--result", required=True, help="Path to result CSV (train_with_predictions.csv หรือ predictions.csv)")
     ap.add_argument("--out", default="plots/check_results/result.png")
+    ap.add_argument("--show_filters", action="store_true", help="Plot medium/heavy filtered waveform (kernel=11,51)")
     ap.add_argument("--ncols", type=int, default=5)
     ap.add_argument("--per_page", type=int, default=20)
     args = ap.parse_args()
@@ -64,7 +68,19 @@ def main():
             sub = raw[raw["wave_id"] == wid].sort_values(time_col)
             
             # พล็อตคลื่น
-            ax.plot(sub[time_col], sub[val_col], color='gray', alpha=0.5, linewidth=0.8)
+            t = sub[time_col].to_numpy(dtype=float)
+            x = sub[val_col].to_numpy(dtype=float)
+            N = len(x)
+
+            # raw
+            ax.plot(t, x, color='gray', alpha=0.5, linewidth=0.8)
+
+            # filtered (เหมือน make_wide)
+            if args.show_filters:
+                x_med = medfilt(x, kernel_size=11)
+                x_heavy = medfilt(x, kernel_size=(51 if N > 51 else 11))
+                ax.plot(t, x_med, linewidth=1.0, alpha=0.9)     # medium
+                ax.plot(t, x_heavy, linewidth=1.2, alpha=0.95)  # heavy
             
             # พล็อตเส้นแนวตั้ง (ค่าที่เลือกตามโหมด)
             if wid in val_map:
@@ -79,7 +95,9 @@ def main():
                 
                 ax.text(t_val, ax.get_ylim()[1], f"{t_val:.2f}ms", 
                         color=line_color, fontsize=7, ha='center', va='bottom', fontweight='bold')
-            
+
+            if args.show_filters and i == 0:
+                 ax.legend(["raw", "med k=11", f"heavy k={'51' if N > 51 else '11'}"], fontsize=6, loc="upper right")    
             ax.grid(True, alpha=0.2)
             ax.tick_params(labelsize=7)
 

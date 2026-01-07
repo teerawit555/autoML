@@ -1,4 +1,11 @@
 # Python virtual environments
+
+# Ignore huge data files
+data/raw/*.csv
+data/processed/train/*.csv
+data/processed/inference/*.csv
+data/processed/prediction/*.csv
+
 AutogluonModels/
 venv311/
 __pycache__/

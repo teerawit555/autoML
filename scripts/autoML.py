@@ -377,28 +377,34 @@ def predict(
     wait_pred = np.expm1(np.asarray(wait_log_pred, dtype=float))
     wait_pred = np.clip(wait_pred, 0, None)
 
-    # ======================================================
-    # HYBRID LOGIC OVERRIDE
-    # ======================================================
-    # ใช้ Logic Flag จาก df ต้นฉบับมาบังคับค่า (Override AI)
-    # Sine/Pulse หรือ Glitch ที่ Logic จับได้ จะถูกบังคับเป็น 0.0ms ทันที
+    # ----------------------
+    #  AI decision (allow 0.0 internally)
+    # ----------------------
+    ai_pred = np.where(is_zero_pred, 0.0, wait_pred)
+    ai_pred = np.clip(ai_pred, 0.0, None)   # กันค่าติดลบหลุดมา
 
+    # ----------------------
+    # HYBRID LOGIC OVERRIDE (force 0.0)
+    # ----------------------
     if "logic_flag_continuous" in df.columns:
-        mask_cont = df["logic_flag_continuous"] == 1
-        count_cont = mask_cont.sum()
+        mask_cont = (df["logic_flag_continuous"] == 1)
+        count_cont = int(mask_cont.sum())
         if count_cont > 0:
             print(f"⚡ Applying Logic Override for Continuous Waves: {count_cont} items forced to 0.0ms")
-            final_pred[mask_cont] = 0.0
+            ai_pred[mask_cont] = 0.0
 
     if "logic_flag_glitch" in df.columns:
-        mask_glitch = df["logic_flag_glitch"] == 1
-        count_glitch = mask_glitch.sum()
+        mask_glitch = (df["logic_flag_glitch"] == 1)
+        count_glitch = int(mask_glitch.sum())
         if count_glitch > 0:
             print(f"⚡ Applying Logic Override for Glitch: {count_glitch} items forced to 0.0ms")
-            final_pred[mask_glitch] = 0.0
-    # ======================================================
-    # ---- force display 0.0ms as 100us (0.1ms) ----
-    final_pred = np.where(final_pred == 0.0, 0.1, final_pred)
+            ai_pred[mask_glitch] = 0.0
+
+    # ----------------------
+    # Final display constraint: 0.0ms -> 0.1ms (100us)
+    # ----------------------
+    eps = 1e-12  # กัน float error
+    final_pred = np.where(np.abs(ai_pred) <= eps, 0.1, ai_pred)
     final_pred = np.maximum(final_pred, 0.1)
 
     # Output (คงโครง: wave_id + pred ก่อน)

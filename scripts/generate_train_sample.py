@@ -1,78 +1,129 @@
 # scripts/generate_train_sample.py
+"""
+Generate synthetic training waveform data.
+
+This script creates multiple waveform families (Type 0–5) and exports them
+to a long-format CSV: one row per (wave_id, sample).
+
+Columns:
+- wave_id: waveform index
+- type: waveform type label
+- sample: sample index within the waveform
+- time_ms: time in milliseconds
+- value: signal value
+- sd: estimated noise scale used in generation
+- low_limit / high_limit: band limits around the target value
+"""
+
 import argparse
+import math
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from pathlib import Path
- 
-# ==========================================
-# 1. Helper Functions (Utilities)
-# ==========================================
 
-def apply_cosine_taper_settling(signal_array, time_vector, settling_time_s, target_value, strength=1):
-    """
-    strength=1.0 -> บังคับนิ่งเต็มที่ (เหมือนเดิม)
-    strength<1.0 -> ปล่อยให้ยังเหลือ deviation บ้าง (ดูเหมือนจริงขึ้น)
-    """
-    fade_mask = np.zeros_like(time_vector)
-    active_idx = time_vector < settling_time_s
 
-    if np.any(active_idx):
-        t_ratio = time_vector[active_idx] / max(settling_time_s, 1e-12)
-        fade_mask[active_idx] = 0.5 * (1 + np.cos(np.pi * t_ratio))
+# =============================================================================
+# 1) Utility Functions
+# =============================================================================
+
+def apply_cosine_taper_settling(
+    signal_array: np.ndarray,
+    time_vector: np.ndarray,
+    settling_time_s: float,
+    target_value: float,
+    strength: float = 1.0
+) -> np.ndarray:
+    """
+    Smoothly forces the signal to approach the target value by the settling time
+    using a cosine taper mask.
+
+    Parameters
+    ----------
+    signal_array : np.ndarray
+        Input signal array.
+    time_vector : np.ndarray
+        Time array (seconds), same length as signal_array.
+    settling_time_s : float
+        Settling time in seconds.
+    target_value : float
+        Final target value after settling.
+    strength : float, default=1.0
+        1.0 -> full taper (strong enforcement)
+        0.0 -> no taper (original signal)
+
+    Returns
+    -------
+    np.ndarray
+        Tapered signal.
+    """
+    fade_mask = np.zeros_like(time_vector, dtype=float)
+    active = time_vector < settling_time_s
+
+    if np.any(active):
+        # Cosine taper from 1 -> 0 across [0, settling_time_s)
+        t_ratio = time_vector[active] / max(settling_time_s, 1e-12)
+        fade_mask[active] = 0.5 * (1.0 + np.cos(np.pi * t_ratio))
 
     deviation = signal_array - target_value
-    smoothed_signal = target_value + (deviation * fade_mask)
+    tapered = target_value + deviation * fade_mask
 
-    # ✅ key: blend กลับกับสัญญาณเดิม เพื่อลดความ “เป๊ะ”
-    # strength=1 -> ใช้ smoothed ล้วน
-    # strength=0 -> ไม่ taper เลย
-    return strength * smoothed_signal + (1.0 - strength) * signal_array
+    # Blend with original to avoid an overly "perfect" settling behavior.
+    return strength * tapered + (1.0 - strength) * signal_array
 
 
 def add_post_settle_noise(
-    signal_array, time_vector, settling_time_s, target_value, rng,
-    probability=0.9,
+    signal_array: np.ndarray,
+    time_vector: np.ndarray,
+    settling_time_s: float,
+    target_value: float,
+    rng: np.random.Generator,
+    probability: float = 0.9,
     post_sd_scale=(0.0008, 0.0014),
     smoothness_range=(20, 40),
-    add_wobble_prob=0.18,
+    add_wobble_prob: float = 0.18,
     wobble_scale=(0.00010, 0.00022),
     wobble_win_range=(35, 80),
 ):
     """
-    เบากว่าเดิม:
-    - floor noise (ตลอด)
-    - post-settle wiggle (MA 1 ครั้ง)
-    - optional wobble (MA ใหญ่ 1 ครั้ง แค่บางเส้น)
-    """
+    Adds noise in a measurement-like way:
+    1) Floor noise across the entire record.
+    2) Post-settle correlated wiggle (moving average once).
+    3) Optional larger "wobble" (rare, longer window moving average).
 
-    # 1) floor noise
+    Returns
+    -------
+    (signal_array, final_sd)
+        final_sd is the maximum noise scale used.
+    """
+    # 1) Floor noise (always present)
     base_floor_sd = max(target_value * rng.uniform(0.0001, 0.00025), 1e-6)
-    signal_array += rng.normal(0.0, base_floor_sd, size=len(time_vector))
+    signal_array = signal_array + rng.normal(0.0, base_floor_sd, size=len(time_vector))
     final_sd = base_floor_sd
 
-    settle_idx = np.searchsorted(time_vector, settling_time_s)
+    # Identify post-settle segment
+    settle_idx = int(np.searchsorted(time_vector, settling_time_s))
     remaining_len = len(time_vector) - settle_idx
     if remaining_len <= 5:
         return signal_array, final_sd
 
-    # 2) post-settle wiggle
+    # 2) Post-settle correlated wiggle
     if rng.random() < probability:
         post_sd = max(target_value * rng.uniform(*post_sd_scale), 1e-6)
         final_sd = max(final_sd, post_sd)
 
         raw = rng.normal(0.0, post_sd, size=remaining_len)
-
         smoothness = int(rng.integers(smoothness_range[0], smoothness_range[1] + 1))
         smoothness = min(smoothness, remaining_len - 1)
 
         if smoothness > 2:
             k = np.ones(smoothness) / smoothness
-            wig = np.convolve(raw, k, mode="same") * np.sqrt(smoothness)
+            wig = np.convolve(raw, k, mode="same") * math.sqrt(smoothness)
             signal_array[settle_idx:] += wig
         else:
             signal_array[settle_idx:] += raw
 
-    # 3) optional wobble (ลดโอกาส + ลดแรง)
+    # 3) Optional wobble (rare, lower probability)
     if rng.random() < add_wobble_prob:
         wob_sd = max(target_value * rng.uniform(*wobble_scale), 1e-6)
         final_sd = max(final_sd, wob_sd)
@@ -83,201 +134,155 @@ def add_post_settle_noise(
 
         if win > 3:
             k2 = np.ones(win) / win
-            wob = np.convolve(wob, k2, mode="same") * np.sqrt(win)
+            wob = np.convolve(wob, k2, mode="same") * math.sqrt(win)
 
         signal_array[settle_idx:] += wob
 
     return signal_array, final_sd
 
-def add_dc_offset_and_drift(y, t, rng, offset_frac=(0.0, 0.01), drift_frac=(0.0, 0.01)):
-    """เพิ่ม offset และ linear drift เล็กน้อย"""
-    off = rng.uniform(*offset_frac)
-    drift = rng.uniform(-drift_frac[1], drift_frac[1])
-    return y + off + drift * (t / max(t[-1], 1e-12))
 
-def add_time_delay(t, rng, max_delay_s=0.0006):
-    """ทำ delay แบบสุ่ม (เลื่อนเวลา)"""
-    d = rng.uniform(0.0, max_delay_s)
+def add_time_delay(t: np.ndarray, rng: np.random.Generator, max_delay_s: float = 0.0006):
+    """
+    Applies a random time delay (time shift).
+    Returns the delayed time array and the delay value.
+    """
+    d = float(rng.uniform(0.0, max_delay_s))
     return np.clip(t - d, 0.0, None), d
 
-def add_quantization(y, rng, q_step_frac=0.0005):
-    """จำลอง ADC quantization เล็กน้อย"""
-    q = max(np.abs(np.mean(y)) * q_step_frac, 1e-6)
-    return np.round(y / q) * q
 
-# ==========================================
-# 2. Signal Generator Functions (Refactored Names)
-# ==========================================
- 
-def generate_step_response(time_vector, target_value, settling_time_s, limit_low, limit_high, random_gen):
-    """ Type 0: Standard Step Response (more realistic post-settle) """
-    freq_hz = random_gen.uniform(100, 1200)
-    angular_freq = 2 * np.pi * freq_hz
+# =============================================================================
+# 2) Waveform Generators (Type 0–5)
+# =============================================================================
+
+def generate_step_response(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
+    """
+    Type 0: Step response with damped ringing + measurement-like post-settle noise.
+    """
+    freq_hz = float(rng.uniform(100, 1200))
+    w1 = 2.0 * np.pi * freq_hz
     band_half = (limit_high - limit_low) / 2.0
 
-    if target_value < 1.0:
-        overshoot_scale = random_gen.uniform(1.5, 8.0)
+    overshoot_scale = float(rng.uniform(1.5, 8.0 if target_value < 1.0 else 15.0))
+    direction = float(rng.choice([1.0, -1.0]))
+    amp0 = band_half * overshoot_scale * direction
+
+    tau = max(settling_time_s / float(rng.uniform(2.5, 6.0)), 1e-6)
+    time_constant_rise = max(settling_time_s / float(rng.uniform(3.0, 10.0)), 1e-6)
+
+    # Random delay on time axis
+    t_eff, _ = add_time_delay(time_vector, rng, max_delay_s=0.0006)
+
+    # Rise (1-pole or 2-pole)
+    if rng.random() < 0.5:
+        base = target_value * (1.0 - np.exp(-t_eff / time_constant_rise))
     else:
-        overshoot_scale = random_gen.uniform(1.5, 15.0)
+        tau2 = max(time_constant_rise * float(rng.uniform(1.5, 4.0)), 1e-6)
+        base = target_value * (1.0 - 0.6*np.exp(-t_eff/time_constant_rise) - 0.4*np.exp(-t_eff/tau2))
 
-    direction = random_gen.choice([1, -1])
-    amplitude_0 = band_half * overshoot_scale * direction
-
-    decay_factor = random_gen.uniform(2.5, 6.0)
-    tau = max(settling_time_s / decay_factor, 1e-6)
- 
-    rise_factor = random_gen.uniform(3.0, 10.0)
-    time_constant_rise = max(settling_time_s / rise_factor, 1e-6)
-
-    # (A) random delay
-    t_eff, _delay_s = add_time_delay(time_vector, random_gen, max_delay_s=0.0006)
-
-    # base rise: 1-pole or 2-pole
-    if random_gen.random() < 0.5:
-        base_response = target_value * (1 - np.exp(-t_eff / time_constant_rise))
+    # Ringing (single-tone or mixed-tone)
+    if rng.random() < 0.6:
+        ring = amp0 * np.exp(-t_eff / tau) * np.sin(w1 * t_eff)
     else:
-        tau2 = max(time_constant_rise * random_gen.uniform(1.5, 4.0), 1e-6)
-        base_response = target_value * (1 - 0.6*np.exp(-t_eff/time_constant_rise) - 0.4*np.exp(-t_eff/tau2))
+        freq2 = freq_hz * float(rng.uniform(0.75, 1.25))
+        w2 = 2.0 * np.pi * freq2
+        mix = float(rng.uniform(0.2, 0.6))
+        ring = amp0 * np.exp(-t_eff / tau) * ((1.0 - mix) * np.sin(w1 * t_eff) + mix * np.sin(w2 * t_eff))
 
-    # ringing: 1-tone or 2-tone mix
-    if random_gen.random() < 0.6:
-        ringing = amplitude_0 * np.exp(-t_eff / tau) * np.sin(angular_freq * t_eff)
-    else:
-        freq2 = freq_hz * random_gen.uniform(0.75, 1.25)
-        w2 = 2 * np.pi * freq2
-        mix = random_gen.uniform(0.2, 0.6)
-        ringing = amplitude_0 * np.exp(-t_eff / tau) * (
-            (1 - mix) * np.sin(angular_freq * t_eff) + mix * np.sin(w2 * t_eff)
-        )
+    y = base + ring
 
-    raw_signal = base_response + ringing
+    # Optional early kick transient
+    if rng.random() < 0.25:
+        kick_amp = (limit_high - limit_low) * float(rng.uniform(0.15, 0.8)) * float(rng.choice([1.0, -1.0]))
+        kick_tau = max(settling_time_s / float(rng.uniform(6.0, 14.0)), 1e-6)
+        y += kick_amp * np.exp(-t_eff / kick_tau)
 
-    # optional kick
-    if random_gen.random() < 0.25:
-        kick_amp = (limit_high - limit_low) * random_gen.uniform(0.15, 0.8)
-        kick_amp *= random_gen.choice([1.0, -1.0])
-        kick_tau = max(settling_time_s / random_gen.uniform(6.0, 14.0), 1e-6)
-        raw_signal += kick_amp * np.exp(-t_eff / kick_tau)
+    # Imperfect taper to avoid overly ideal settling
+    taper_strength = float(rng.uniform(0.78, 0.95))
+    y = apply_cosine_taper_settling(y, time_vector, settling_time_s, target_value, strength=taper_strength)
 
-    # ✅ (NEW) make taper less "perfect" like Type 1
-    taper_strength = random_gen.uniform(0.78, 0.95)  # ยิ่งต่ำ ยิ่งไม่เป๊ะ
-    smooth_signal = apply_cosine_taper_settling(
-        raw_signal, time_vector, settling_time_s, target_value,
-        strength=taper_strength
-    )
-
-    # ✅ (NEW) stronger post-settle wiggle (แต่ไม่ให้ sine-y เกิน)
-    final_signal, max_noise = add_post_settle_noise(
-        smooth_signal, time_vector, settling_time_s, target_value, random_gen,
-        probability=0.95,        # ให้ติด post-noise เกือบทุกเส้น
-        smoothness_range=(10, 28),   # กลางๆ: สั่นเป็นริ้ว ไม่เป็น sine ยาว
+    # Post-settle noise texture
+    y, sd = add_post_settle_noise(
+        y, time_vector, settling_time_s, target_value, rng,
+        probability=0.95,
+        smoothness_range=(10, 28),
         post_sd_scale=(0.0009, 0.0016),
         add_wobble_prob=0.35,
         wobble_scale=(0.00012, 0.00030),
     )
 
-    return final_signal, max_noise, "type0_step_response", float(settling_time_s*1000.0), 0
-
+    return y, sd, "type0_Step_Response", float(settling_time_s * 1000.0), 0
 
 
 def generate_high_start_oscillation(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
     """
-    Type 1 (optimized):
-    - cycles เยอะขึ้นได้
-    - valley ไม่ลงที่เดิม (transient bias)
-    - valley ลึก -> peak2 มักสูง (coupling แบบเบาและคำนวณเฉพาะช่วง)
-    - บางเส้น underdamped ยาว
+    Type 1: High-start underdamped oscillation with envelope shaping and post-settle noise.
     """
-
     band = float(limit_high - limit_low)
 
-    # 0) cycles
-    if rng.random() < 0.70:
-        num_cycles = int(rng.integers(2, 4))   # 2-3
-    else:
-        num_cycles = int(rng.integers(4, 7))   # 4-6
+    # Number of cycles within settling window
+    num_cycles = int(rng.integers(2, 4)) if rng.random() < 0.70 else int(rng.integers(4, 7))
 
-    # 1) delay
+    # Random delay on time axis
     t_eff, _ = add_time_delay(time_vector, rng, max_delay_s=0.0004)
 
-    # 2) omega
     freq = num_cycles / max(settling_time_s, 1e-6)
-    w = 2 * np.pi * freq
-
-    # jitter บางเส้น
+    w = 2.0 * np.pi * freq
     if rng.random() < 0.35:
-        w *= rng.uniform(0.88, 1.12)
+        w *= float(rng.uniform(0.88, 1.12))
 
-    # 3) amplitude + transient bias
-    A = band * rng.uniform(2.0, 4.0)
-
-    bias_amp = band * rng.uniform(-0.55, 0.55)
-    bias_tau = max(settling_time_s / rng.uniform(0.9, 2.2), 1e-6)
+    # Oscillation amplitude and transient bias
+    A = band * float(rng.uniform(2.0, 4.0))
+    bias_amp = band * float(rng.uniform(-0.55, 0.55))
+    bias_tau = max(settling_time_s / float(rng.uniform(0.9, 2.2)), 1e-6)
     bias = bias_amp * np.exp(-t_eff / bias_tau)
 
-    # 4) envelope (2-stage แต่เรียบขึ้น)
-    tau_slow = max(settling_time_s * rng.uniform(0.65, 1.35), 1e-6)
-    tau_fast = max(tau_slow / rng.uniform(2.2, 4.8), 1e-6)
-    t_switch = settling_time_s * rng.uniform(0.22, 0.42)
+    # Envelope shaping
+    tau_slow = max(settling_time_s * float(rng.uniform(0.65, 1.35)), 1e-6)
+    tau_fast = max(tau_slow / float(rng.uniform(2.2, 4.8)), 1e-6)
+    t_switch = settling_time_s * float(rng.uniform(0.22, 0.42))
 
-    # underdamped long ringing บางเส้น
     if rng.random() < 0.22:
-        tau_slow *= rng.uniform(1.5, 2.8)
-        tau_fast *= rng.uniform(2.0, 4.5)
-        t_switch = settling_time_s * rng.uniform(0.30, 0.55)
+        tau_slow *= float(rng.uniform(1.5, 2.8))
+        tau_fast *= float(rng.uniform(2.0, 4.5))
+        t_switch = settling_time_s * float(rng.uniform(0.30, 0.55))
 
     env = np.where(
         t_eff < t_switch,
         np.exp(-t_eff / tau_slow),
-        np.exp(-t_switch / tau_slow) * np.exp(-(t_eff - t_switch) / tau_fast)
+        np.exp(-t_switch / tau_slow) * np.exp(-(t_eff - t_switch) / tau_fast),
     )
 
-    # 5) coupling แบบ “เบา” (คำนวณเฉพาะ early window)
-    # early window ~ 1.8 cycles
-    T = (2*np.pi) / max(w, 1e-12)
-    t_gate_end = 1.8 * T
-    early_mask = (t_eff >= 0.0) & (t_eff <= t_gate_end)
-
+    # Mild coupling: deeper valley -> slightly boosted mid-window amplitude
+    T = (2.0*np.pi) / max(w, 1e-12)
+    early_mask = (t_eff >= 0.0) & (t_eff <= 1.8 * T)
     if np.any(early_mask):
-        te = t_eff[early_mask]
-        eve = env[early_mask]
-        bse = bias[early_mask]
-
-        y_early = target_value + bse + (A * eve * np.cos(w * te))
-        valley_depth = float(target_value - np.min(y_early))  # >0 => ลงลึก
-
+        y_early = target_value + bias[early_mask] + (A * env[early_mask] * np.cos(w * t_eff[early_mask]))
+        valley_depth = float(target_value - np.min(y_early))
         depth_ratio = np.clip(valley_depth / max(band, 1e-12), 0.0, 1.8)
 
-        # boost peak2 window ~ 1.0–2.2 cycles
-        k_boost = rng.uniform(0.55, 1.05)
-        boost_amp = 1.0 + k_boost * depth_ratio
-
-        t1 = 1.0 * T
-        t2 = 2.2 * T
-        mid_mask = (t_eff >= t1) & (t_eff <= t2)
+        boost_amp = 1.0 + float(rng.uniform(0.55, 1.05)) * depth_ratio
+        mid_mask = (t_eff >= 1.0 * T) & (t_eff <= 2.2 * T)
         if np.any(mid_mask):
-            x = (t_eff[mid_mask] - t1) / max((t2 - t1), 1e-12)
-            bump = 0.5 - 0.5*np.cos(2*np.pi*x)  # 0..1..0
+            x = (t_eff[mid_mask] - 1.0 * T) / max((2.2 * T - 1.0 * T), 1e-12)
+            bump = 0.5 - 0.5*np.cos(2.0*np.pi*x)  # 0..1..0
             env[mid_mask] *= (1.0 + (boost_amp - 1.0) * bump)
 
-    # 6) oscillation (ลด 2-tone เหลือแค่บาง %)
+    # Optional 2-tone mix
     if rng.random() < 0.18:
-        w2 = w * rng.uniform(0.85, 1.15)
-        mix = rng.uniform(0.25, 0.55)
-        osc = A * env * ((1 - mix) * np.cos(w * t_eff) + mix * np.cos(w2 * t_eff))
+        w2 = w * float(rng.uniform(0.85, 1.15))
+        mix = float(rng.uniform(0.25, 0.55))
+        osc = A * env * ((1.0 - mix) * np.cos(w * t_eff) + mix * np.cos(w2 * t_eff))
     else:
         osc = A * env * np.cos(w * t_eff)
 
-    raw = target_value + bias + osc
+    y = target_value + bias + osc
 
-    # 7) taper (อย่าเป๊ะเกิน แต่ไม่ทำหลายทาง)
-    taper_strength = rng.uniform(0.78, 0.95) if rng.random() < 0.45 else 1.0
-    taper_settle = settling_time_s * rng.uniform(0.60, 0.90) if rng.random() < 0.25 else settling_time_s
-    smooth = apply_cosine_taper_settling(raw, time_vector, taper_settle, target_value, strength=taper_strength)
+    taper_strength = float(rng.uniform(0.78, 0.95)) if rng.random() < 0.45 else 1.0
+    taper_settle = settling_time_s * float(rng.uniform(0.60, 0.90)) if rng.random() < 0.25 else settling_time_s
+    y = apply_cosine_taper_settling(y, time_vector, taper_settle, target_value, strength=taper_strength)
 
-    # 8) noise หลังนิ่ง
-    final, sd = add_post_settle_noise(
-        smooth, time_vector, settling_time_s, target_value, rng,
+    y, sd = add_post_settle_noise(
+        y, time_vector, settling_time_s, target_value, rng,
         probability=0.9,
         post_sd_scale=(0.0008, 0.0013),
         smoothness_range=(10, 20),
@@ -285,148 +290,114 @@ def generate_high_start_oscillation(time_vector, target_value, settling_time_s, 
         wobble_scale=(0.00010, 0.00022),
     )
 
-    return final, sd, "type1_Damped_Osc", float(settling_time_s * 1000.0), 0
+    return y, sd, "type1_Damped_Osc", float(settling_time_s * 1000.0), 0
 
 
-def generate_continuous_triangular_pulses(time_vector, target_value, settling_time_s, limit_low, limit_high, random_gen):
+def generate_continuous_triangular_pulses(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
     """
-    Type 2: Continuous Triangular Pulse Train.
-    Generates continuous triangular pulses with variable or constant Height/Period.
-    (No noise, continuous signal).
+    Type 2: Triangular pulse train (no explicit settling in current implementation).
+    Note: This remains as-is from your current behavior: continuous pulses + small noise.
     """
-    signal_array = np.full_like(time_vector, target_value)
-    # Configuration flags
-    is_height_const = random_gen.choice([True, False])
-    is_period_const = random_gen.choice([True, False])
-    subtype_str = f"type2_tri_H{'const' if is_height_const else 'var'}_T{'const' if is_period_const else 'var'}"
- 
-    # Parameters
-    avg_height = (limit_high - limit_low) * random_gen.uniform(0.5, 1.5)
-    avg_period = random_gen.uniform(settling_time_s / 3.0, settling_time_s / 1.5)
-    pulse_width = avg_period * random_gen.uniform(0.15, 0.3)
- 
-    current_time = random_gen.uniform(0, avg_period * 0.3)
- 
-    while current_time < time_vector[-1]:
-        # Determine Height
-        if is_height_const:
-            height = avg_height
-        else:
-            height = avg_height * random_gen.uniform(0.5, 1.5)
- 
-        # Draw Triangle
+    y = np.full_like(time_vector, target_value, dtype=float)
+
+    is_height_const = bool(rng.choice([True, False]))
+    is_period_const = bool(rng.choice([True, False]))
+
+    avg_height = (limit_high - limit_low) * float(rng.uniform(0.5, 1.5))
+    avg_period = float(rng.uniform(settling_time_s / 3.0, settling_time_s / 1.5))
+    pulse_width = avg_period * float(rng.uniform(0.15, 0.30))
+    current_time = float(rng.uniform(0.0, avg_period * 0.3))
+
+    while current_time < float(time_vector[-1]):
+        height = avg_height if is_height_const else avg_height * float(rng.uniform(0.5, 1.5))
+
         t_start = current_time
-        t_peak = current_time + pulse_width / 2
+        t_peak = current_time + pulse_width / 2.0
         t_end = current_time + pulse_width
- 
-        # Rise phase
-        mask_rise = (time_vector >= t_start) & (time_vector < t_peak)
-        if np.any(mask_rise):
-            signal_array[mask_rise] += (height / (pulse_width/2)) * (time_vector[mask_rise] - t_start)
-        # Fall phase
-        mask_fall = (time_vector >= t_peak) & (time_vector < t_end)
-        if np.any(mask_fall):
-            signal_array[mask_fall] += height - (height / (pulse_width/2)) * (time_vector[mask_fall] - t_peak)
- 
-        # Determine next Period
-        if is_period_const:
-            period = avg_period
-        else:
-            period = avg_period * random_gen.uniform(0.7, 1.3)
+
+        rise = (time_vector >= t_start) & (time_vector < t_peak)
+        if np.any(rise):
+            y[rise] += (height / (pulse_width / 2.0)) * (time_vector[rise] - t_start)
+
+        fall = (time_vector >= t_peak) & (time_vector < t_end)
+        if np.any(fall):
+            y[fall] += height - (height / (pulse_width / 2.0)) * (time_vector[fall] - t_peak)
+
+        period = avg_period if is_period_const else avg_period * float(rng.uniform(0.7, 1.3))
         current_time += period
-    
-    noise_level_pct = random_gen.uniform(0.00005, 0.0002)
-    sd_noise = max(target_value * noise_level_pct, 1e-6)
-    signal_array += random_gen.normal(0.0, sd_noise, size=len(time_vector))
-    
-    return signal_array, sd_noise, "type2_Triangle_Wave", 0.0, 1
+
+    noise_level_pct = float(rng.uniform(0.00005, 0.0002))
+    sd = max(target_value * noise_level_pct, 1e-6)
+    y += rng.normal(0.0, sd, size=len(time_vector))
+
+    return y, sd, "type2_Triangle_Wave", 0.0, 1
 
 
-def generate_low_swing_sine_wave(time_vector, target_value, settling_time_s, limit_low, limit_high, random_gen):
+def generate_low_swing_sine_wave(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
     """
-    Type 3: Low Swing Sine Wave (Sea Wave).
-    Generates a continuous sine wave with low amplitude and very low noise.
+    Type 3: Low-amplitude sine oscillation around the target value.
     """
-    signal_array = np.full_like(time_vector, target_value)
-    freq_hz = random_gen.uniform(200, 500) 
-    angular_freq = 2 * np.pi * freq_hz
-    # Amplitude: Low swing
-    amplitude = (limit_high - limit_low) * random_gen.uniform(0.1, 0.25)
-    # Phase shift
-    phase = random_gen.uniform(0, 2 * np.pi)
-    # Generate Base Wave
-    oscillation = amplitude * np.sin(angular_freq * time_vector + phase)
-    signal_array += oscillation
-    # Add Noise (0-0.002%)
-    noise_level_pct = random_gen.uniform(0.0, 0.00002)
-    sd_noise = max(target_value * noise_level_pct, 1e-6)
-    signal_array += random_gen.normal(0.0, sd_noise, size=len(time_vector))
-    
-    return signal_array, sd_noise, "type3_sine_wave", 0.0, 1
+    y = np.full_like(time_vector, target_value, dtype=float)
+
+    freq_hz = float(rng.uniform(200, 500))
+    w = 2.0 * np.pi * freq_hz
+    amplitude = (limit_high - limit_low) * float(rng.uniform(0.1, 0.25))
+
+    phase = float(rng.choice([0.0, np.pi]))
+    y += amplitude * np.sin(w * time_vector + phase)
+
+    noise_level_pct = float(rng.uniform(0.0, 0.00002))
+    sd = max(target_value * noise_level_pct, 1e-6)
+    y += rng.normal(0.0, sd, size=len(time_vector))
+
+    return y, sd, "type3_Sine_Wave", 0.0, 1
 
 
-def generate_overdamped_decay(time_vector, target_value, settling_time_s, limit_low, limit_high, random_gen):
+def generate_overdamped_decay(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
     """
-    Type 4: Overdamped Decay (Signal 2 Style).
-    - Starts High.
-    - Smooth exponential decay to Final Value (No Ringing).
-    - Adds small noise after settle.
+    Type 4: Overdamped exponential decay toward the target value (no ringing).
     """
-    # 1. Start Amplitude (Start High)
-    start_amplitude = (limit_high - limit_low) * random_gen.uniform(1.5, 3.0)
-    
-    # 2. Decay Parameter (Overdamped - ลงแบบเนิบๆ)
-    tau = settling_time_s / random_gen.uniform(3.0, 5.0)
-    
-    # 3. Math Model: Exponential Decay (No Oscillation)
-    decay_curve = start_amplitude * np.exp(-time_vector / tau)
-    raw_signal = target_value + decay_curve
+    start_amp = (limit_high - limit_low) * float(rng.uniform(1.5, 3.0))
+    tau = settling_time_s / float(rng.uniform(3.0, 5.0))
 
-    # 4. Post-processing (บังคับหางให้นิ่ง)
-    smooth_signal = apply_cosine_taper_settling(raw_signal, time_vector, settling_time_s, target_value)
-    
-    # 5. [IMPORTANT] Add post-settle noise (เติม Noise นิดๆ ตามที่ขอ)
-    # ฟังก์ชันนี้จะเติมทั้ง Floor Noise และ Burst Noise (ขยุกขยิกเล็กน้อย)
-    final_signal, max_noise = add_post_settle_noise(smooth_signal, time_vector, settling_time_s, target_value, random_gen)
-    
-    return final_signal, max_noise, "type4_overdamped_decay", float(settling_time_s*1000.0), 0
+    y = target_value + start_amp * np.exp(-time_vector / max(tau, 1e-12))
+    y = apply_cosine_taper_settling(y, time_vector, settling_time_s, target_value, strength=1.0)
+
+    y, sd = add_post_settle_noise(y, time_vector, settling_time_s, target_value, rng)
+    return y, sd, "type4_overdamped_decay", float(settling_time_s * 1000.0), 0
+
 
 def generate_pulse_train(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
     """
     Type 5: Steady baseline + POSITIVE square pulses (no settling).
-    - Baseline stays near target_value for the whole record.
-    - Pulses occur periodically; amplitude can be high or low.
-    - Per-pulse amplitude varies, with chance to repeat previous amplitude.
-    - Guarantees at least 1 pulse in the record.
+    - Baseline stays at the target value for the whole record.
+    - Pulses are periodic with per-pulse amplitude variation.
+    - There is a controlled probability (p_same) that consecutive pulses share the same amplitude.
+    - Guarantees at least one pulse is present.
     """
     y = np.full_like(time_vector, target_value, dtype=float)
     band = float(limit_high - limit_low)
 
-    # --- choose "style" per waveform: high or low amplitude ---
-    if rng.random() < 0.35:
-        amp_scale = rng.uniform(1.2, 2.5)   # high pulses
-    else:
-        amp_scale = rng.uniform(0.25, 1.1)  # low/medium pulses
+    # Waveform-level amplitude family (high vs low)
+    amp_scale = float(rng.uniform(1.2, 2.5)) if rng.random() < 0.35 else float(rng.uniform(0.25, 1.1))
+    base_amp = band * amp_scale  # positive baseline pulse amplitude scale
 
-    base_amp = band * amp_scale  # ✅ base amplitude ต่อ waveform (positive)
-
-    # --- period & duty ---
+    # Period and width control (long period, short width)
     t_end = float(time_vector[-1])
-    period = rng.uniform(t_end / 5.0, t_end / 2.0)   # คาบยาวขึ้น
-    duty = rng.uniform(0.08, 0.20)                  # pulse แคบ
-    jitter_frac = rng.uniform(0.00, 0.08)
+    period = float(rng.uniform(t_end / 5.0, t_end / 2.0))
+    duty = float(rng.uniform(0.08, 0.20))
+    jitter_frac = float(rng.uniform(0.00, 0.08))
 
-    # start offset
-    current_time = rng.uniform(0.0, period * 0.6)
+    current_time = float(rng.uniform(0.0, period * 0.6))
 
-    # amplitude repeat probability
+    # Amplitude repeat behavior
     p_same = 0.35
     prev_amp = None
     has_pulse = False
 
     while current_time < t_end:
-        this_period = period * rng.uniform(1.0 - jitter_frac, 1.0 + jitter_frac)
-        width = max(this_period * duty * rng.uniform(0.85, 1.15), 1e-6)
+        this_period = period * float(rng.uniform(1.0 - jitter_frac, 1.0 + jitter_frac))
+        width = max(this_period * duty * float(rng.uniform(0.85, 1.15)), 1e-6)
 
         t_start = current_time
         t_stop = min(current_time + width, t_end)
@@ -435,26 +406,24 @@ def generate_pulse_train(time_vector, target_value, settling_time_s, limit_low, 
         if np.any(mask):
             has_pulse = True
 
-            # decide this pulse amplitude
             if (prev_amp is not None) and (rng.random() < p_same):
                 this_amp = prev_amp
             else:
-                this_amp = base_amp * rng.uniform(0.4, 1.6)  # สุ่มใหม่ต่อ pulse
+                this_amp = base_amp * float(rng.uniform(0.4, 1.6))
                 prev_amp = this_amp
 
-            # ✅ IMPORTANT: actually add pulse to signal
             y[mask] += this_amp
 
         current_time += this_period
 
-    # Guarantee at least one pulse
+    # Ensure at least one pulse exists
     if not has_pulse:
         t_mid = 0.5 * t_end
         width = 0.05 * t_end
         mask = (time_vector >= t_mid) & (time_vector < t_mid + width)
         y[mask] += base_amp
 
-    # add only "family floor noise" (no post-settle wiggle)
+    # Add only floor noise to stay within the same family as other generators
     y, sd = add_post_settle_noise(
         y, time_vector,
         settling_time_s=0.0,
@@ -464,13 +433,48 @@ def generate_pulse_train(time_vector, target_value, settling_time_s, limit_low, 
         add_wobble_prob=0.0,
     )
 
-    return y, sd, "type5_Square_Pulse_Train", 0.0, 1
+    return y, sd, "type5_Square_Pulse_Wave", 0.0, 1
 
 
-# ==========================================
-# 3. Main Script (Standard Structure)
-# ==========================================
- 
+# =============================================================================
+# 3) Main: Dataset Generation
+# =============================================================================
+
+def build_generation_plan(n_waves: int, ratios, rng: np.random.Generator):
+    """
+    Converts ratio specification into a shuffled list of generator functions.
+
+    Parameters
+    ----------
+    n_waves : int
+        Total number of waveforms.
+    ratios : list[(callable, float)]
+        Each entry is (generator_function, ratio).
+    rng : np.random.Generator
+        RNG for shuffling.
+
+    Returns
+    -------
+    list[callable]
+        Shuffled generator list of length n_waves.
+    """
+    plan = []
+    allocated = 0
+
+    for func, r in ratios:
+        cnt = int(n_waves * float(r))
+        plan.extend([func] * cnt)
+        allocated += cnt
+
+    # Assign any remainder to the first generator to keep total length == n_waves
+    remainder = n_waves - allocated
+    if remainder > 0:
+        plan.extend([ratios[0][0]] * remainder)
+
+    rng.shuffle(plan)
+    return plan
+
+
 def main():
     ap = argparse.ArgumentParser(description="Generate synthetic TRAINING waveform data.")
     ap.add_argument("--out", default="data/raw/data1000samples_train.csv", help="Output CSV path")
@@ -478,97 +482,69 @@ def main():
     ap.add_argument("--dt_ms", type=float, default=0.01, help="Time step in milliseconds")
     ap.add_argument("--t_end_ms", type=float, default=9.9, help="End time in milliseconds")
     args = ap.parse_args()
- 
+
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
- 
-    t_ms = np.arange(0, args.t_end_ms + 1e-12, args.dt_ms)
+
+    # Time axis (ms for export, seconds for generation math)
+    t_ms = np.arange(0.0, args.t_end_ms + 1e-12, args.dt_ms)
     t_s = t_ms / 1000.0
- 
-    rows = []
-    master_rng = np.random.default_rng(12345)
- 
-    # Update list with new formal function names
-    signal_generators = [
-    generate_step_response,
-    generate_high_start_oscillation,
-    generate_continuous_triangular_pulses,
-    generate_low_swing_sine_wave,
-    generate_overdamped_decay,
-    generate_pulse_train,   # NEW
+
+    # Ratio plan: include all waveform families (Type 0–5)
+    ratios = [
+        (generate_step_response,               0.28),  # Type 0
+        (generate_high_start_oscillation,      0.22),  # Type 1
+        (generate_overdamped_decay,            0.18),  # Type 4
+        (generate_pulse_train,                 0.14),  # Type 5
+        (generate_continuous_triangular_pulses,0.09),  # Type 2
+        (generate_low_swing_sine_wave,         0.09),  # Type 3
     ]
 
+    master_rng = np.random.default_rng(12345)
+    gen_sequence = build_generation_plan(args.n_waves, ratios, master_rng)
 
+    rows = []
     print(f"Generating TRAINING dataset ({args.n_waves} waves)...")
-    
-    # --- Balanced Distribution Logic ---
-    ratios = [
-    (generate_step_response,              0.28),  # Type 0
-    (generate_high_start_oscillation,     0.22),  # Type 1
-    (generate_overdamped_decay,           0.18),  # Type 4
-    (generate_pulse_train,                0.14),  # Type 5
-    (generate_continuous_triangular_pulses,0.09), # Type 2
-    (generate_low_swing_sine_wave,        0.09),  # Type 3  
-    ]   
 
-
-    plan = []
-    current = 0
-    for func, r in ratios:
-        cnt = int(args.n_waves * r)
-        plan.append((func, cnt))
-        current += cnt
-
-    remainder = args.n_waves - current
-    if remainder > 0:
-        f0, c0 = plan[0]
-        plan[0] = (f0, c0 + remainder)
-
-    gen_sequence = []
-    for f, cnt in plan:
-        gen_sequence.extend([f] * cnt)
-
-    master_rng.shuffle(gen_sequence)
-    shuffled_gens = gen_sequence
-
-    for wave_id in range(1, args.n_waves + 1):
-        final_value = master_rng.uniform(0.5, 3.5)
-        band_pct = master_rng.uniform(0.05, 0.15)
+    for wave_id, gen_func in enumerate(gen_sequence, start=1):
+        # Target value and band (limits) per waveform
+        final_value = float(master_rng.uniform(0.5, 3.5))
+        band_pct = float(master_rng.uniform(0.05, 0.15))
         band = final_value * band_pct
-        low, high = final_value - band/2, final_value + band/2
-        settle_time_ms = master_rng.uniform(2.0, 8.0)
+        low = final_value - band / 2.0
+        high = final_value + band / 2.0
+
+        # Settling time is used only by settling-based waveform types
+        settle_time_ms = float(master_rng.uniform(2.0, 8.0))
         settle_s = settle_time_ms / 1000.0
- 
-        gen_func = master_rng.choice(signal_generators)
+
+        # Per-wave RNG ensures reproducibility per waveform id
         wave_rng = np.random.default_rng(100000 + wave_id)
 
         y, used_sd, type_name, true_settle_ms, true_is_zero = gen_func(
             t_s, final_value, settle_s, low, high, wave_rng
         )
- 
+
+        # Export rows in long format
         for i, (tm, val) in enumerate(zip(t_ms, y)):
             rows.append({
                 "wave_id": wave_id,
+                "type": type_name,
                 "sample": i,
                 "time_ms": float(tm),
                 "value": float(val),
                 "sd": float(used_sd),
                 "low_limit": float(low),
-                "high_limit": float(high),    
+                "high_limit": float(high),
+                # Optional labels (uncomment if you need them in training):
+                # "true_settle_ms": float(true_settle_ms),
+                # "true_is_zero": int(true_is_zero),
             })
- 
+
     df = pd.DataFrame(rows)
     df.to_csv(out_path, index=False)
     print(f"Successfully saved TRAINING data to: {out_path}")
-    print(f"Total rows generated: {len(df)}")
-    print("Distribution:", df.groupby('wave_id')['signal_type'].first().value_counts())
- 
+
+
 if __name__ == "__main__":
     main()
-
-
- 
- 
- 
- 
- 

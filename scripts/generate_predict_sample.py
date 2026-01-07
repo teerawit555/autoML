@@ -76,8 +76,8 @@ def main():
 
         wave_rng = np.random.default_rng(500000 + wave_id)
 
-        y, used_sd, _, _ = gen_func(
-            t_s, final_value, settle_s, low, high, wave_rng
+        y, used_sd, *_ = gen_func(
+          t_s, final_value, settle_s, low, high, wave_rng
         )
 
         # ---- predict-only disturbance ----

@@ -377,10 +377,6 @@ def predict(
     wait_pred = np.expm1(np.asarray(wait_log_pred, dtype=float))
     wait_pred = np.clip(wait_pred, 0, None)
 
-    # ถ้า Model ทายว่าเป็น Zero Class (0.0) ให้ปัดเป็น 0.1 (Default)
-    final_pred = np.where(is_zero_pred, 0.1, wait_pred)
-    final_pred = np.maximum(final_pred, 0.1)
-
     # ======================================================
     # HYBRID LOGIC OVERRIDE
     # ======================================================
@@ -401,6 +397,9 @@ def predict(
             print(f"⚡ Applying Logic Override for Glitch: {count_glitch} items forced to 0.0ms")
             final_pred[mask_glitch] = 0.0
     # ======================================================
+    # ---- force display 0.0ms as 100us (0.1ms) ----
+    final_pred = np.where(final_pred == 0.0, 0.1, final_pred)
+    final_pred = np.maximum(final_pred, 0.1)
 
     # Output (คงโครง: wave_id + pred ก่อน)
     out = df_feat.copy()

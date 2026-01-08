@@ -328,7 +328,9 @@ def generate_continuous_triangular_pulses(time_vector, target_value, settling_ti
 
     noise_level_pct = float(rng.uniform(0.00005, 0.0002))
     sd = max(target_value * noise_level_pct, 1e-6)
-    y += rng.normal(0.0, sd, size=len(time_vector))
+    early = time_vector < (0.2 * time_vector[-1])
+    y[early] = np.maximum(y[early], target_value)
+
 
     return y, sd, "type2_Triangle_Wave", 0.0, 1
 
@@ -364,7 +366,45 @@ def generate_overdamped_decay(time_vector, target_value, settling_time_s, limit_
     y = apply_cosine_taper_settling(y, time_vector, settling_time_s, target_value, strength=1.0)
 
     y, sd = add_post_settle_noise(y, time_vector, settling_time_s, target_value, rng)
-    return y, sd, "type4_overdamped_decay", float(settling_time_s * 1000.0), 0
+    return y, sd, "type4_overdamped_no_overshoot", float(settling_time_s * 1000.0), 0
+
+def generate_overdamped_decay1(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
+    """
+    Type 4 (modified): Overdamped bi-exponential with a single undershoot ("overshoot before settling")
+    - No sinusoid, so still not 'ringing' in the oscillatory sense.
+    - Shape: start high -> dip below target once -> recover to target.
+    """
+    band = float(limit_high - limit_low)
+
+    # --- time constants (fast then slow) ---
+    # fast decays quickly, slow decays more slowly (controls recovery tail)
+    tau_fast = max(settling_time_s / float(rng.uniform(6.0, 12.0)), 1e-6)
+    tau_slow = max(settling_time_s / float(rng.uniform(1.8, 3.5)), 1e-6)
+
+    # --- amplitudes ---
+    # A_pos sets initial height above target
+    A_pos = band * float(rng.uniform(1.5, 3.0))
+
+    # A_neg controls how deep the undershoot is
+    # keep A_neg a bit smaller than A_pos so y(0) still above target
+    A_neg = A_pos * float(rng.uniform(0.35, 0.75))
+
+    # bi-exponential: +fast -slow  -> creates one dip below target then returns
+    y = target_value + A_pos * np.exp(-time_vector / tau_fast) - A_neg * np.exp(-time_vector / tau_slow)
+
+    # Optional: make the dip occur "ก่อนถึงเส้นนิ่ง" มากขึ้นด้วย time delay เล็ก ๆ
+    if rng.random() < 0.35:
+        t_eff, _ = add_time_delay(time_vector, rng, max_delay_s=0.0004)
+        y = target_value + A_pos * np.exp(-t_eff / tau_fast) - A_neg * np.exp(-t_eff / tau_slow)
+
+    # taper ให้เข้าหา target ช่วงใกล้ settling_time (กันปลายแกว่ง/เพี้ยนเกิน)
+    taper_strength = float(rng.uniform(0.85, 1.0))
+    y = apply_cosine_taper_settling(y, time_vector, settling_time_s, target_value, strength=taper_strength)
+
+    # post-settle noise
+    y, sd = add_post_settle_noise(y, time_vector, settling_time_s, target_value, rng)
+
+    return y, sd, "type4_overdamped_decay_overshoot", float(settling_time_s * 1000.0), 0
 
 
 def generate_pulse_train(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
@@ -436,6 +476,50 @@ def generate_pulse_train(time_vector, target_value, settling_time_s, limit_low, 
     return y, sd, "type5_Square_Pulse_Wave", 0.0, 1
 
 
+def generate_no_undershoot_ringing(
+    time_vector, target_value, settling_time_s, limit_low, limit_high, rng
+):
+    """
+    Ringing decay แต่ "ไม่ลงต่ำกว่า target" (no undershoot)
+    ได้ทรงแบบเส้นแดง: ลงมา + แกว่ง แต่ minimum อยู่เหนือ target แล้วค่อยนิ่ง
+    """
+    t = time_vector.astype(float)
+    t_end = float(t[-1]) if len(t) else 0.0
+    band = float(limit_high - limit_low)
+
+    # 1) baseline decay จากค่าเริ่มต้น (เริ่มสูงกว่า target)
+    start_offset = band * float(rng.uniform(0.6, 1.4))   # สูงกว่า target
+    tau_base = float(rng.uniform(max(t_end/8, 1e-6), max(t_end/3, 1e-6)))
+    base = target_value + start_offset * np.exp(-t / tau_base)
+
+    # 2) ringing แบบ "บวกเท่านั้น" (rectified) -> ไม่ undershoot
+    # เลือกความถี่ให้มี 2-5 รอบในช่วงก่อนนิ่ง
+    n_cycles = float(rng.uniform(2.0, 5.0))
+    f = n_cycles / max(settling_time_s, t_end, 1e-6)  # cycles per second
+    phi = float(rng.uniform(0, 2*np.pi))
+
+    ring_amp0 = band * float(rng.uniform(0.15, 0.45))
+    tau_ring = float(rng.uniform(max(t_end/10, 1e-6), max(t_end/2.5, 1e-6)))
+    envelope = np.exp(-t / tau_ring)
+
+    # rectified sine: (sin + 1)/2 อยู่ใน [0,1]
+    ring = ring_amp0 * envelope * (0.5 * (np.sin(2*np.pi*f*t + phi) + 1.0))
+
+    y = base + ring
+
+    # 3) กันหลุดต่ำกว่า target แบบชัวร์ (ถ้าคุณต้องการ 100% no-undershoot)
+    y = np.maximum(y, target_value)
+
+    # 4) noise เล็ก ๆ
+    noise_sd = max(abs(target_value) * float(rng.uniform(5e-5, 2e-4)), 1e-6)
+    y += rng.normal(0.0, noise_sd, size=len(t))
+
+    # กัน noise ทำหลุดต่ำกว่า target (ถ้าต้อง no-undershoot แบบสุด)
+    y = np.maximum(y, target_value)
+
+    return y, noise_sd, "typeX_NoUndershoot_Ringing", 0.0, 1
+
+
 # =============================================================================
 # 3) Main: Dataset Generation
 # =============================================================================
@@ -492,13 +576,18 @@ def main():
 
     # Ratio plan: include all waveform families (Type 0–5)
     ratios = [
-        (generate_step_response,               0.28),  # Type 0
-        (generate_high_start_oscillation,      0.22),  # Type 1
-        (generate_overdamped_decay,            0.18),  # Type 4
-        (generate_pulse_train,                 0.14),  # Type 5
-        (generate_continuous_triangular_pulses,0.09),  # Type 2
-        (generate_low_swing_sine_wave,         0.09),  # Type 3
+        (generate_step_response,               0.26),  # Type 0
+        (generate_high_start_oscillation,      0.20),  # Type 1
+
+        (generate_overdamped_decay,            0.18),  # Type 4 (เรียบ)
+        (generate_overdamped_decay1,           0.10),  # Type 4.1 (เรียบ + overshoot)
+
+        (generate_pulse_train,                 0.12),  # Type 5
+        (generate_continuous_triangular_pulses,0.07),  # Type 2
+        (generate_low_swing_sine_wave,         0.07),  # Type 3
     ]
+   
+
 
     master_rng = np.random.default_rng(12345)
     gen_sequence = build_generation_plan(args.n_waves, ratios, master_rng)

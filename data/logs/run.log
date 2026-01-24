@@ -1,0 +1,46 @@
+2026-01-23 11:22:30,941 | INFO | 📂 Loading PRED features: data/processed/features/pred_features.csv
+2026-01-23 11:22:30,969 | INFO | PRED engineered feature summary:
+       band_to_p2p  tail_noise_ratio  enter_vs_settle    slope_norm
+count  2000.000000       2000.000000     2.000000e+03   2000.000000
+mean      0.264592          0.222521     8.448207e+05  15922.237388
+std       0.435458          0.413991     1.512101e+06  29183.169243
+min       0.000416          0.000402     0.000000e+00    462.982731
+25%       0.002147          0.002159     0.000000e+00   2094.478892
+50%       0.007019          0.007093     9.955944e-01   3726.149684
+75%       0.991379          0.032026     1.600000e+06   7836.210008
+max       1.000000          1.808036     7.160000e+06  99954.277948
+2026-01-23 11:22:34,536 | INFO | ✅ Saved predictions to: data\processed\analysis\predictions.csv
+2026-01-24 16:13:08,525 | INFO | 📂 Loading PRED features: data/processed/features/pred_features.csv
+2026-01-24 16:13:08,577 | INFO | PRED engineered feature summary:
+       band_to_p2p  tail_noise_ratio  enter_vs_settle    slope_norm
+count  2000.000000       2000.000000     2.000000e+03   2000.000000
+mean      0.264592          0.222521     8.448207e+05  15922.237388
+std       0.435458          0.413991     1.512101e+06  29183.169243
+min       0.000416          0.000402     0.000000e+00    462.982731
+25%       0.002147          0.002159     0.000000e+00   2094.478892
+50%       0.007019          0.007093     9.955944e-01   3726.149684
+75%       0.991379          0.032026     1.600000e+06   7836.210008
+max       1.000000          1.808036     7.160000e+06  99954.277948
+2026-01-24 16:13:33,756 | INFO | 📂 Loading PRED features: data/processed/features/pred_features.csv
+2026-01-24 16:13:33,787 | INFO | PRED engineered feature summary:
+       band_to_p2p  tail_noise_ratio  enter_vs_settle    slope_norm
+count  2000.000000       2000.000000     2.000000e+03   2000.000000
+mean      0.264592          0.222521     8.448207e+05  15922.237388
+std       0.435458          0.413991     1.512101e+06  29183.169243
+min       0.000416          0.000402     0.000000e+00    462.982731
+25%       0.002147          0.002159     0.000000e+00   2094.478892
+50%       0.007019          0.007093     9.955944e-01   3726.149684
+75%       0.991379          0.032026     1.600000e+06   7836.210008
+max       1.000000          1.808036     7.160000e+06  99954.277948
+2026-01-24 16:19:55,532 | INFO | 📂 Loading PRED features: data/processed/features/pred_features.csv
+2026-01-24 16:19:55,560 | INFO | PRED engineered feature summary:
+       band_to_p2p  tail_noise_ratio  enter_vs_settle    slope_norm
+count  2000.000000       2000.000000     2.000000e+03   2000.000000
+mean      0.264592          0.222521     8.448207e+05  15922.237388
+std       0.435458          0.413991     1.512101e+06  29183.169243
+min       0.000416          0.000402     0.000000e+00    462.982731
+25%       0.002147          0.002159     0.000000e+00   2094.478892
+50%       0.007019          0.007093     9.955944e-01   3726.149684
+75%       0.991379          0.032026     1.600000e+06   7836.210008
+max       1.000000          1.808036     7.160000e+06  99954.277948
+2026-01-24 16:20:00,044 | INFO | ✅ Saved predictions to: data\processed\analysis\predictions.csv

@@ -1,772 +1,348 @@
+#scripts/autoML.py
 from __future__ import annotations
 
-from datetime import datetime
 import argparse
-import json
-import os
-import sys
+import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import torch
-
 from autogluon.tabular import TabularPredictor
 
-
-# =========================
-# CONFIG
-# =========================
-# Meta columns ที่ไม่อยากให้โมเดลใช้เทรน (ยังคง wave_id ไว้ทำ report)
-COLS_TO_DROP = ["force_mA", "range_V", "temp_C"]
-ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-DEFAULT_SAVE_PATH = f"AutogluonModels/ag-{ts}"
-
-
-# =========================
-# HELPERS
-# =========================
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def save_json(path: str, obj) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
+# ==========================================================
+# Fixed Feature Set (ใช้เหมือนกันทั้ง TRAIN และ PRED)
+# ==========================================================
+FEATURE_COLS = [
+    "t_enter_band_ms",
+    "enter_margin_ms",
+    "t_enter_norm",
+    "enter_vs_settle",
+    "band_to_p2p",
+    "band_width",
+    "t_est_settle_ms",
+    "tail_p2p",
+    "std_value",   
+    "max_slope",
+]
 
 
-def load_json(path: str, default=None):
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+
+# ==========================================================
+# Constants
+# ==========================================================
+EPS = 1e-12
+MIN_PRED_MS = 0.1
+
+WATCH_COLS = [
+    "t_enter_band_ms",
+    "t_est_settle_ms",
+    "band_width",
+    "tail_p2p",   
+    "tail_std",
+    "max_slope",
+]
 
 
-def save_text(path: str, text: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+# ==========================================================
+# Logging (datalog)
+# ==========================================================
+def setup_logger(log_path: str) -> logging.Logger:
+    log_file = Path(log_path)
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("runlog")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setFormatter(fmt)
+    fh.setLevel(logging.INFO)
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    sh.setLevel(logging.INFO)
+
+    logger.addHandler(fh)
+    logger.addHandler(sh)
+    return logger
 
 
-def load_text(path: str, default: str = "") -> str:
-    if not os.path.exists(path):
-        return default
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read().strip()
+# ==========================================================
+# Helpers
+# ==========================================================
+def ensure_required_columns(df: pd.DataFrame, cols: list[str], context: str) -> None:
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"{context}: missing required columns: {missing}\n"
+            f"Available columns: {list(df.columns)}"
+        )
 
 
-def align_columns(df: pd.DataFrame, required_cols: list[str]) -> pd.DataFrame:
+def log_df_describe(logger: logging.Logger, df: pd.DataFrame, cols: list[str], title: str) -> None:
+    present = [c for c in cols if c in df.columns]
+    if not present:
+        logger.info(f"{title}: (no columns found)")
+        return
+    logger.info(f"{title}:\n{df[present].describe().to_string()}")
+
+
+def save_and_log_worst(
+    logger: logging.Logger,
+    out_df: pd.DataFrame,
+    name: str,
+    topn: int = 20
+) -> None:
+    if "abs_error_ms" not in out_df.columns:
+        return
+
+    logger.info(f"{name}: abs_error summary:\n{out_df['abs_error_ms'].describe().to_string()}")
+    worst = out_df.sort_values("abs_error_ms", ascending=False).head(topn)
+    logger.info(f"{name}: Top-{topn} worst:\n{worst.to_string(index=False)}")
+
+
+def add_engineered_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    ทำให้คอลัมน์ "ตรงกับตอนเทรน" แบบไม่พัง:
-    - ถ้าขาด: เติม 0
-    - ถ้าเกิน: ตัดทิ้ง
-    - จัดเรียงตาม required_cols
+    ทำ feature engineering ให้เหมือนเดิม (TRAIN/PRED ทำเหมือนกัน)
+    NOTE: ตอนนี้ FEATURE_COLS อาจจะไม่ได้ใช้ทุกตัวที่สร้างไว้ แต่คง behavior เดิมไว้
     """
     out = df.copy()
-    for c in required_cols:
-        if c not in out.columns:
-            out[c] = 0.0
-    out = out[required_cols]
+
+    # ต้องมีคอลัมน์พื้นฐานที่ใช้คำนวณ
+    needed = ["band_width", "p2p_value", "tail_std", "std_value", "t_enter_band_ms", "t_est_settle_ms", "max_slope"]
+    missing = [c for c in needed if c not in out.columns]
+    if missing:
+        # ไม่ raise เพื่อไม่เปลี่ยน behavior แบบเดิมมากเกินไป
+        # แต่โดยปกติถ้าขาด แปลว่า features_csv ไม่ถูกต้อง
+        return out
+
+    out["band_to_p2p"] = out["band_width"] / (out["p2p_value"] + EPS)
+    out["tail_noise_ratio"] = out["tail_std"] / (out["std_value"] + EPS)
+    out["enter_vs_settle"] = out["t_enter_band_ms"] / (out["t_est_settle_ms"] + 1e-6)
+    out["slope_norm"] = out["max_slope"] / (out["p2p_value"] + EPS)
     return out
 
 
-def pick_best_zero_threshold(
-    proba_is_zero: np.ndarray,
-    wait_pred: np.ndarray,
-    y_true: np.ndarray,
-    thr_min: float = 0.20,
-    thr_max: float = 0.80,
-    steps: int = 121,
-) -> tuple[float, float]:
-    """
-    เลือก threshold ที่ทำให้ MAE ต่ำสุดบนชุด train (ทั้งชุด)
-    y_hat = 0 ถ้า proba >= thr, ไม่งั้นใช้ wait_pred
-    """
-    best_thr = 0.5
-    best_mae = float("inf")
-
-    thr_grid = np.linspace(thr_min, thr_max, steps)
-    for thr in thr_grid:
-        is_zero = proba_is_zero >= thr
-        y_hat = np.where(is_zero, 0.0, wait_pred)
-        mae = float(np.mean(np.abs(y_hat - y_true)))
-        if mae < best_mae:
-            best_mae = mae
-            best_thr = float(thr)
-
-    return best_thr, best_mae
-
-
-def proba_class1(p) -> np.ndarray:
-    """
-    AutoGluon บางเวอร์ชันคืน DataFrame(0/1), บางทีคืน ndarray/Series
-    เราดึง proba ของ class=1 ให้ชัวร์
-    """
-    if hasattr(p, "columns") and (1 in list(p.columns)):
-        return p[1].to_numpy()
-    arr = np.asarray(p)
-    # ถ้าเป็น shape (n,2) ให้เอาคอลัมน์ 1
-    if arr.ndim == 2 and arr.shape[1] >= 2:
-        return arr[:, 1]
-    return arr.astype(float)
-
-
-# =========================
+# ==========================================================
 # TRAIN
-# =========================
-def train(
-    data_path: str,
-    label: str = "wait_time_ms",
-    model_dir: str | None = None,
-    presets: str = "medium_quality",
-    time_limit: int = 120,
-) -> None:
-    if not os.path.exists(data_path):
-        raise FileNotFoundError(f'Input file not found: "{data_path}"')
+# ==========================================================
+def run_train(features_csv: str, out_dir: str, seed: int, log_path: str) -> None:
+    logger = setup_logger(log_path)
 
-    df = pd.read_csv(data_path)
+    model_dir = Path(out_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- 1) basic sanity ---
-    if "wave_id" not in df.columns:
-        df["wave_id"] = np.arange(len(df), dtype=int)
-    wave_id_backup = df["wave_id"].copy()
+    logger.info(f"📂 Loading TRAIN features: {features_csv}")
+    df = pd.read_csv(features_csv)
 
-    # ตัดแถว label ว่าง
-    df_train = df.dropna(subset=[label]).reset_index(drop=True)
+    # ทำ feature engineering (เอาไว้เหมือนเดิม แต่ไม่ทำซ้ำสองรอบแล้ว)
+    df = add_engineered_features(df)
 
-    # สร้าง label ของ zero classifier
-    df_train["is_zero"] = (df_train[label] == 0).astype(int)
+    # log engineered summary (เหมือนเดิม)
+    engineered_cols = ["band_to_p2p", "tail_noise_ratio", "enter_vs_settle", "slope_norm"]
+    present_eng = [c for c in engineered_cols if c in df.columns]
+    if present_eng:
+        logger.info("Engineered feature summary:\n" + df[present_eng].describe().to_string())
 
-    u = df_train["is_zero"].unique()
-    if len(u) < 2:
-        raise ValueError(
-            f"is_zero has only 1 class in training data: {u}. "
-            f"เช็ค label wait_time_ms แล้ว regenerate train_features ใหม่"
-        )
+    ensure_required_columns(df, ["wave_id", "wait_time_ms"], "TRAIN")
+    ensure_required_columns(df, FEATURE_COLS, "TRAIN")
 
-    # เวลาแบ่งให้ 2-stage
-    t_zero = max(30, int(time_limit * 0.25))
-    t_reg = max(60, int(time_limit * 0.75))
+    logger.info(f"Rows={len(df)} | Cols={len(df.columns)}")
+    logger.info("Label (wait_time_ms) summary:\n" + df["wait_time_ms"].describe().to_string())
 
-    save_path = model_dir or DEFAULT_SAVE_PATH
-    zero_model_path = os.path.join(save_path, "zero_clf")
-    reg_model_path = os.path.join(save_path, "wait_reg")
-    _ensure_dir(save_path)
+    log_df_describe(logger, df, WATCH_COLS, "Key feature summary")
 
-    gpu_count = 1 if torch.cuda.is_available() else 0
-    print(f"🚀 Training device: {'GPU (CUDA)' if gpu_count > 0 else 'CPU'}")
-    print(f"presets={presets} time_limit={time_limit}s (zero={t_zero}s reg={t_reg}s)")
+    # สร้าง data สำหรับ AutoGluon
+    X = df[FEATURE_COLS].copy()
+    y = df["wait_time_ms"].astype(float)
+    wave_id = df["wave_id"].copy()
 
-    # cols_to_drop_found (meta)
-    cols_to_drop_found = [c for c in COLS_TO_DROP if c in df_train.columns]
-    if cols_to_drop_found:
-        print(f"Dropping meta columns: {cols_to_drop_found}")
+    data = X.copy()
+    data["wait_time_ms"] = y
+    data["wave_id"] = wave_id  # เก็บไว้ export (โมเดลไม่เห็น)
 
-    # =========================
-    # Stage A: Zero Classifier
-    # =========================
-    df_zero = df_train.drop(columns=cols_to_drop_found, errors="ignore").copy()
-    # ห้ามให้เห็น label จริง และ wave_id
-    df_zero = df_zero.drop(columns=[label, "wave_id"], errors="ignore")
+    # ----------------------------
+    # Split 80 / 20
+    # ----------------------------
+    rng = np.random.default_rng(seed)
+    idx = np.arange(len(data))
+    rng.shuffle(idx)
 
-    # บันทึกคอลัมน์ที่ใช้เทรน (เพื่อ align ตอน predict)
-    zero_feature_cols = [c for c in df_zero.columns if c != "is_zero"]
-    save_json(os.path.join(save_path, "zero_feature_cols.json"), zero_feature_cols)
+    split_at = int(0.8 * len(idx))
+    train_idx = idx[:split_at]
+    val_idx = idx[split_at:]
 
-    zero_clf = TabularPredictor(
-        label="is_zero",
-        path=zero_model_path,
-        problem_type="binary",
-        eval_metric="f1",
-        verbosity=2,
-    ).fit(
-        train_data=df_zero,
-        presets=presets,
-        time_limit=t_zero,
-        num_gpus=gpu_count,
-        dynamic_stacking=False,
-    )
+    train_data = data.iloc[train_idx].reset_index(drop=True)
+    val_data = data.iloc[val_idx].reset_index(drop=True)
 
-    # =========================
-    # Stage B: Wait Regressor (non-zero only)
-    # =========================
-    df_nonzero = df_train[df_train[label] > 0].copy()
-    if len(df_nonzero) < 5:
-        raise ValueError(
-            f"non-zero samples too few ({len(df_nonzero)}). "
-            f"ต้องมีเคส wait>0 มากกว่านี้เพื่อเทรน regressor"
-        )
+    logger.info(f"Split: train={len(train_data)} | val={len(val_data)}")
+    logger.info(f"Using {len(FEATURE_COLS)} fixed features: {FEATURE_COLS}")
+    logger.info(f"[DEBUG][TRAIN] FEATURE_COLS = {FEATURE_COLS}")
 
-    # log1p เพื่อให้สเกลนิ่งขึ้น
-    df_nonzero["wait_time_log"] = np.log1p(df_nonzero[label].astype(float))
-
-    df_reg = df_nonzero.drop(columns=cols_to_drop_found, errors="ignore").copy()
-    # ห้ามใช้ wave_id / label เดิม / is_zero
-    df_reg_for_fit = df_reg.drop(columns=["wave_id", label, "is_zero"], errors="ignore")
-
-    # บันทึกคอลัมน์ที่ reg ใช้เทรน
-    reg_feature_cols = [c for c in df_reg_for_fit.columns if c != "wait_time_log"]
-    save_json(os.path.join(save_path, "reg_feature_cols.json"), reg_feature_cols)
-
-    wait_reg = TabularPredictor(
-        label="wait_time_log",
-        path=reg_model_path,
+    # ----------------------------
+    # Train AutoGluon
+    # ----------------------------
+    logger.info("🚀 Training AutoGluon...")
+    predictor = TabularPredictor(
+        label="wait_time_ms",
         problem_type="regression",
         eval_metric="mean_absolute_error",
-        verbosity=2,
-    ).fit(
-        train_data=df_reg_for_fit,
-        presets=presets,
-        time_limit=t_reg,
-        num_gpus=gpu_count,
-        dynamic_stacking=False,
+        path=str(model_dir),
     )
 
-    # =========================
-    # 3) ANALYSIS (คงโครงเดิม + เพิ่ม auto-threshold)
-    # =========================
-    print("\n" + "=" * 60)
-    print(" DEEP MODEL ANALYSIS & DIAGNOSIS")
-    print("=" * 60)
-
-    # A. Feature Importance (Regressor)
-    print("\n[1] Calculating Feature Importance (Regressor)...")
-    importance = wait_reg.feature_importance(df_reg_for_fit)
-    print(importance.head(15))
-
-    # B. Leaderboard (Regressor)
-    print("\n[2] Model Leaderboard (Regressor):")
-    leaderboard = wait_reg.leaderboard(df_reg_for_fit, silent=True)
-    cols_lb = [c for c in ["model", "score_val", "pred_time_val", "fit_time"] if c in leaderboard.columns]
-    print(leaderboard[cols_lb].head(5))
-
-    # C. Residual Analysis (2-stage)
-    X_all = df_train.drop(columns=[label])
-    y_actual = df_train[label].to_numpy(dtype=float)
-
-    # ลบ meta
-    X_feat = X_all.drop(columns=cols_to_drop_found, errors="ignore").copy()
-
-    # --- Zero proba ---
-    X_zero_in = X_feat.drop(columns=["wave_id"], errors="ignore").copy()
-    # align ให้ตรงกับตอนเทรน
-    X_zero_in = align_columns(X_zero_in, zero_feature_cols)
-    proba = zero_clf.predict_proba(X_zero_in)
-    proba_is_zero = proba_class1(proba)
-
-    # --- Regressor prediction (ให้ pred ได้ “ทุกแถว” เพื่อใช้เลือก threshold) ---
-    X_reg_in = X_feat.drop(columns=["wave_id", "is_zero", label, "wait_time_log"], errors="ignore").copy()
-    X_reg_in = align_columns(X_reg_in, reg_feature_cols)
-    wait_log_pred = wait_reg.predict(X_reg_in)
-    wait_pred = np.expm1(np.asarray(wait_log_pred, dtype=float))
-    wait_pred = np.clip(wait_pred, 0, None)
-
-    # --- Auto pick threshold จาก train ---
-    best_thr, best_mae = pick_best_zero_threshold(
-        proba_is_zero=proba_is_zero,
-        wait_pred=wait_pred,
-        y_true=y_actual,
-        thr_min=0.20,
-        thr_max=0.80,
-        steps=121,
+    predictor.fit(
+        train_data=train_data.drop(columns=["wave_id"]),
+        tuning_data=val_data.drop(columns=["wave_id"]),
+        presets="medium_quality",
+        verbosity=1,
     )
-    save_text(os.path.join(save_path, "zero_threshold.txt"), str(best_thr))
 
-    print(f"\n[2.5] Auto-picked zero threshold = {best_thr:.3f} (train MAE={best_mae:.3f})")
-    print(f"proba_is_zero min/mean/max = {proba_is_zero.min():.6f} {proba_is_zero.mean():.6f} {proba_is_zero.max():.6f}")
+    # ==========================================================
+    # Predict ALL training data (100%)
+    # ==========================================================
+    logger.info("📤 Predicting ALL training data (100%)...")
+    preds_all = predictor.predict(data[FEATURE_COLS].copy())
+    preds_all = np.maximum(np.asarray(preds_all, dtype=float), MIN_PRED_MS)
 
-    is_zero_pred = proba_is_zero >= best_thr
-    y_pred = np.where(is_zero_pred, 0.0, wait_pred)
-    print(f"predicted zeros = {int(is_zero_pred.sum())} / {len(is_zero_pred)}")
+    extra_cols = [c for c in WATCH_COLS if c in df.columns]
+    out_all = df[["wave_id", "wait_time_ms"] + extra_cols].copy()
+    out_all["pred_wait_time_ms"] = preds_all
+    out_all["error_ms"] = out_all["pred_wait_time_ms"] - out_all["wait_time_ms"]
+    out_all["abs_error_ms"] = out_all["error_ms"].abs()
+    out_all = out_all.sort_values("wave_id").reset_index(drop=True)
 
-    # Report DF
-    out = df_train.copy()
-    out["wave_id"] = wave_id_backup.iloc[df_train.index].values
-    out["pred_wait_time_ms"] = y_pred
-    out["error_ms"] = out["pred_wait_time_ms"] - out[label]
-    out["abs_error_ms"] = out["error_ms"].abs()
+    out_all_path = Path("data/processed/analysis/train_predictions_all.csv")
+    out_all_path.parent.mkdir(parents=True, exist_ok=True)
+    out_all.to_csv(out_all_path, index=False)
 
-    print("\n[3] TOP 10 WORST PREDICTIONS (Review these Wave IDs!):")
-    cols_to_show = ["wave_id", label, "pred_wait_time_ms", "error_ms"]
-    cols_to_show = [c for c in cols_to_show if c in out.columns]
-    worst_10 = out.sort_values(by="abs_error_ms", ascending=False).head(10)
-    print(worst_10[cols_to_show])
+    logger.info(f"✅ Saved ALL-train predictions to: {out_all_path}")
+    save_and_log_worst(logger, out_all, "ALL-TRAIN", topn=20)
 
-    # =========================
-    # 4) SAVE DIAGNOSIS DATA (คงโครงเดิม)
-    # =========================
-    _ensure_dir("data/processed/analysis")
-    _ensure_dir("data/processed/train")
+    # ----------------------------
+    # Evaluate (VAL)
+    # ----------------------------
+    logger.info("📊 Evaluating on validation...")
+    perf = predictor.evaluate(val_data.drop(columns=["wave_id"]))
+    logger.info("Validation performance:")
+    for k, v in perf.items():
+        try:
+            logger.info(f"  {k}: {float(v):.6f}")
+        except Exception:
+            logger.info(f"  {k}: {v}")
 
-    diag_path = f"data/processed/analysis/diagnosis_report_{ts}.csv"
-    out.to_csv(diag_path, index=False)
+    # ------------------------------
+    # Save validation predictions
+    # ------------------------------
+    logger.info("📤 Predicting VAL (20%)...")
+    preds_val = predictor.predict(val_data[FEATURE_COLS].copy())
+    preds_val = np.maximum(np.asarray(preds_val, dtype=float), MIN_PRED_MS)
 
-    feat_imp_path = f"data/processed/analysis/feature_importance_{ts}.csv"
-    importance.to_csv(feat_imp_path)
+    out_val = val_data[["wave_id", "wait_time_ms"]].copy()
+    out_val["pred_wait_time_ms"] = preds_val
+    out_val["error_ms"] = out_val["pred_wait_time_ms"] - out_val["wait_time_ms"]
+    out_val["abs_error_ms"] = out_val["error_ms"].abs()
+    out_val = out_val.sort_values("wave_id").reset_index(drop=True)
 
-    train_out_path = f"data/processed/train/train_with_predictions_{ts}.csv"
-    out.drop(columns=["abs_error_ms"], errors="ignore").to_csv(train_out_path, index=False)
+    out_val_path = Path("data/processed/analysis/val_predictions.csv")
+    out_val_path.parent.mkdir(parents=True, exist_ok=True)
+    out_val.to_csv(out_val_path, index=False)
 
-    print(f"\n✅ Analysis Report Saved: {diag_path}")
-    print(f"✅ Feature Importance Saved: {feat_imp_path}")
-    print(f"✅ Models saved at: {save_path}")
-    print(f"   - Zero classifier: {zero_model_path}")
-    print(f"   - Wait regressor:  {reg_model_path}")
-    print(f"   - Zero threshold:  {best_thr:.3f}  (saved: {os.path.join(save_path, 'zero_threshold.txt')})")
-    print("=" * 60)
+    logger.info(f"✅ Saved validation predictions to: {out_val_path}")
+    save_and_log_worst(logger, out_val, "VAL", topn=20)
+
+    # -------------------------------------------------
+    # Feature Importance
+    # -------------------------------------------------
+    logger.info("🔍 Computing feature importance...")
+    try:
+        lb = predictor.leaderboard(val_data.drop(columns=["wave_id"]), silent=True)
+        best_model = lb.iloc[0]["model"]
+        logger.info(f"Best model for FI: {best_model}")
+
+        fi = predictor.feature_importance(
+            val_data.drop(columns=["wave_id"]),
+            model=best_model
+        )
+        fi = fi.reset_index().rename(columns={"index": "feature"})
+        fi = fi.sort_values("importance", ascending=False).reset_index(drop=True)
+
+        fi_path = Path("data/processed/analysis/feature_importance.csv")
+        fi_path.parent.mkdir(parents=True, exist_ok=True)
+        fi.to_csv(fi_path, index=False)
+
+        logger.info(f"✅ Feature importance saved to: {fi_path}")
+        logger.info("Top-15 FI:\n" + fi.head(15).to_string(index=False))
+
+    except Exception as e:
+        logger.exception(f"❌ Feature importance failed: {e}")
 
 
-# =========================
+# ==========================================================
 # PREDICT
-# =========================
-def predict(
-    model_path: str,
-    input_csv: str,
-    out_csv: str = "predictions.csv",
-) -> None:
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f'Model not found at: "{model_path}"')
+# ==========================================================
+def run_pred(features_csv: str, model_dir: str, out_csv: str, log_path: str) -> None:
+    logger = setup_logger(log_path)
 
-    zero_model_path = os.path.join(model_path, "zero_clf")
-    reg_model_path = os.path.join(model_path, "wait_reg")
-    if not os.path.exists(zero_model_path) or not os.path.exists(reg_model_path):
-        raise FileNotFoundError(
-            "Expected sub-models not found.\n"
-            f"Missing: {zero_model_path} or {reg_model_path}\n"
-            "Train must create both folders: zero_clf + wait_reg"
-        )
+    logger.info(f"📂 Loading PRED features: {features_csv}")
+    df = pd.read_csv(features_csv)
 
-    zero_feature_cols = load_json(os.path.join(model_path, "zero_feature_cols.json"), default=None)
-    reg_feature_cols = load_json(os.path.join(model_path, "reg_feature_cols.json"), default=None)
-    if not zero_feature_cols or not reg_feature_cols:
-        raise FileNotFoundError(
-            "Missing feature column metadata.\n"
-            "Expected: zero_feature_cols.json and reg_feature_cols.json in model folder."
-        )
+    df = add_engineered_features(df)
 
-    threshold = float(load_text(os.path.join(model_path, "zero_threshold.txt"), default="0.5"))
-    print(f"🔮 Loading models and predicting: {input_csv}")
-    print(f"using zero threshold = {threshold:.3f}")
+    engineered_cols = ["band_to_p2p", "tail_noise_ratio", "enter_vs_settle", "slope_norm"]
+    present_eng = [c for c in engineered_cols if c in df.columns]
+    if present_eng:
+        logger.info("PRED engineered feature summary:\n" + df[present_eng].describe().to_string())
 
-    zero_clf = TabularPredictor.load(zero_model_path)
-    wait_reg = TabularPredictor.load(reg_model_path)
+    ensure_required_columns(df, ["wave_id"], "PRED")
+    ensure_required_columns(df, FEATURE_COLS, "PRED")
 
-    df = pd.read_csv(input_csv)
+    X = df[FEATURE_COLS].copy()
+    predictor = TabularPredictor.load(model_dir)
+    logger.info(f"[DEBUG][PRED] FEATURE_COLS = {FEATURE_COLS}")
+    logger.info(f"[DEBUG][PRED] df.columns = {df.columns.tolist()}")
+    logger.info(f"[DEBUG][PRED] Model expects = {predictor.feature_generator.features_in}")
 
-    # backup wave_id เพื่อแปะคืน
-    wave_id_backup = df["wave_id"].copy() if "wave_id" in df.columns else None
+    preds = predictor.predict(X)
+    preds = np.maximum(np.asarray(preds, dtype=float), MIN_PRED_MS)
 
-    # drop meta columns (ให้เหมือนตอนเทรน)
-    cols_to_drop_found = [c for c in COLS_TO_DROP if c in df.columns]
-    df_feat = df.drop(columns=cols_to_drop_found, errors="ignore").copy()
+    out = pd.DataFrame({
+        "wave_id": df["wave_id"].copy(),
+        "pred_wait_time_ms": preds,
+    }).sort_values("wave_id").reset_index(drop=True)
 
-    # ---- Stage A ----
-    X_zero_in = df_feat.drop(columns=["wave_id"], errors="ignore").copy()
-    X_zero_in = align_columns(X_zero_in, zero_feature_cols)
+    out_path = Path(out_csv)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(out_path, index=False)
 
-    proba = zero_clf.predict_proba(X_zero_in)
-    proba_is_zero = proba_class1(proba)
-    is_zero_pred = proba_is_zero >= threshold
-
-    print(f"proba_is_zero min/mean/max = {proba_is_zero.min():.6f} {proba_is_zero.mean():.6f} {proba_is_zero.max():.6f}")
-    print(f"predicted zeros = {int(is_zero_pred.sum())} / {len(is_zero_pred)}")
-
-    # ---- Stage B ----
-    X_reg_in = df_feat.drop(columns=["wave_id", "is_zero", "wait_time_ms", "wait_time_log"], errors="ignore").copy()
-    X_reg_in = align_columns(X_reg_in, reg_feature_cols)
-
-    wait_log_pred = wait_reg.predict(X_reg_in)
-    wait_pred = np.expm1(np.asarray(wait_log_pred, dtype=float))
-    wait_pred = np.clip(wait_pred, 0, None)
-
-    # ----------------------
-    #  AI decision (allow 0.0 internally)
-    # ----------------------
-    ai_pred = np.where(is_zero_pred, 0.0, wait_pred)
-    ai_pred = np.clip(ai_pred, 0.0, None)   # กันค่าติดลบหลุดมา
-
-    # ----------------------
-    # HYBRID LOGIC OVERRIDE (force 0.0)
-    # ----------------------
-    if "logic_flag_continuous" in df.columns:
-        mask_cont = (df["logic_flag_continuous"] == 1)
-        count_cont = int(mask_cont.sum())
-        if count_cont > 0:
-            print(f"⚡ Applying Logic Override for Continuous Waves: {count_cont} items forced to 0.0ms")
-            ai_pred[mask_cont] = 0.0
-
-    if "logic_flag_glitch" in df.columns:
-        mask_glitch = (df["logic_flag_glitch"] == 1)
-        count_glitch = int(mask_glitch.sum())
-        if count_glitch > 0:
-            print(f"⚡ Applying Logic Override for Glitch: {count_glitch} items forced to 0.0ms")
-            ai_pred[mask_glitch] = 0.0
-
-    # ----------------------
-    # Final display constraint: 0.0ms -> 0.1ms (100us)
-    # ----------------------
-    eps = 1e-12  # กัน float error
-    final_pred = np.where(np.abs(ai_pred) <= eps, 0.1, ai_pred)
-    final_pred = np.maximum(final_pred, 0.1)
-
-    # Output (คงโครง: wave_id + pred ก่อน)
-    out = df_feat.copy()
-    if wave_id_backup is not None:
-        out["wave_id"] = wave_id_backup
-
-    out["pred_wait_time_ms"] = final_pred
-
-    # แถม logic flag ติดไปด้วยเพื่อความชัวร์ตอน check results
-    if "logic_flag_continuous" in df.columns:
-        out["logic_flag_continuous"] = df["logic_flag_continuous"]
-
-    first_cols = [c for c in ["wave_id", "pred_wait_time_ms", "logic_flag_continuous"] if c in out.columns]
-    other_cols = [c for c in out.columns if c not in first_cols]
-    out = out[first_cols + other_cols]
-
-    _ensure_dir(os.path.dirname(out_csv) or ".")
-    out.to_csv(out_csv, index=False)
-    print(f"✅ Prediction Results saved: {out_csv}")
+    logger.info(f"✅ Saved predictions to: {out_path}")
 
 
-# =========================
-# CLI
-# =========================
+# ==========================================================
+# Main
+# ==========================================================
 def main():
-    ap = argparse.ArgumentParser(description="AutoGluon 2-stage (zero clf + wait reg) with auto threshold")
-    ap.add_argument("--mode", default="train", choices=["train", "predict"])
-    ap.add_argument("--data", default="data/processed/train/train_features.csv")
-    ap.add_argument("--label", default="wait_time_ms")
-    ap.add_argument("--model-dir", default=None, help="optional custom save dir for train")
-    ap.add_argument("--model-path", default=None, help="required for predict mode")
-    ap.add_argument("--inference-csv", default="data/processed/inference/wide.csv")
-    ap.add_argument("--out", default="data/processed/prediction/predicted_wait_time.csv")
-    ap.add_argument("--time-limit", type=int, default=120)
-    ap.add_argument("--presets", default="medium_quality", help="e.g. medium_quality, high_quality, best_quality")
+    ap = argparse.ArgumentParser("autoML (fixed feature set) - train or predict wait_time_ms")
+    ap.add_argument("--mode", required=True, choices=["train", "pred"])
+    ap.add_argument("--features_csv", required=True)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--log", default="data/logs/run.log")
+
+    # train
+    ap.add_argument("--out_dir", default="models/autoML_wait_time")
+
+    # pred
+    ap.add_argument("--model_dir", default="models/autoML_wait_time")
+    ap.add_argument("--pred_out", default="data/processed/analysis/predictions.csv")
 
     args = ap.parse_args()
 
-    try:
-        if args.mode == "train":
-            train(
-                data_path=args.data,
-                label=args.label,
-                model_dir=args.model_dir,
-                presets=args.presets,
-                time_limit=args.time_limit,
-            )
-        else:
-            if not args.model_path:
-                print("❌ Error: Please specify --model-path for prediction mode.")
-                return
-            predict(
-                model_path=args.model_path,
-                input_csv=args.inference_csv,
-                out_csv=args.out,
-            )
-    except Exception as e:
-        print(f" ERROR: {e}")
-        sys.exit(1)
+    if args.mode == "train":
+        run_train(args.features_csv, args.out_dir, args.seed, args.log)
+    else:
+        run_pred(args.features_csv, args.model_dir, args.pred_out, args.log)
 
 
 if __name__ == "__main__":
     main()
-
-
-#---------------------------------------------
-# V-14
-#---------------------------------------------
-# from __future__ import annotations
-
-# from datetime import datetime
-# from pathlib import Path
-# import argparse
-# import os
-# import sys
-
-# import pandas as pd
-# import numpy as np
-# import torch
-
-# from autogluon.tabular import TabularPredictor
-
-
-# # Meta columns ที่เราจะไม่ใช้เทรน (เพื่อให้ Model โฟกัสที่ลักษณะคลื่น)
-# # NOTE: ไม่ drop wave_id ใน list นี้แล้ว (จะเอาไว้ทำ report/diagnosis)
-# COLS_TO_DROP = ['force_mA', 'range_V', 'temp_C']
-# ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-# DEFAULT_SAVE_PATH = f"AutogluonModels/ag-{ts}"
-
-
-# def train(
-#     data_path: str,
-#     label: str = "wait_time_ms",
-#     model_dir: str | None = None,
-#     presets: str = "medium_quality",
-#     time_limit: int = 60,
-# ) -> None:
-#     if not os.path.exists(data_path):
-#         raise FileNotFoundError(f'Input file not found: "{data_path}"')
-
-#     df = pd.read_csv(data_path)
-
-#     # --- 1. PREPROCESSING ---
-#     if "wave_id" not in df.columns:
-#         df["wave_id"] = np.arange(len(df), dtype=int)
-
-#     wave_id_backup = df["wave_id"].copy()
-
-#     cols_to_drop_found = [c for c in COLS_TO_DROP if c in df.columns]
-#     if cols_to_drop_found:
-#         print(f"Dropping meta columns: {cols_to_drop_found}")
-
-#     df_train = df.dropna(subset=[label]).reset_index(drop=True)
-
-#     # classifier label: is_zero
-#     df_train["is_zero"] = (df_train[label] == 0).astype(int)
-
-#     u = df_train["is_zero"].unique()
-#     if len(u) < 2:
-#         raise ValueError(
-#             f"is_zero has only 1 class in training data: {u}. "
-#             f"Check your labeling (wait_time_ms) and regenerate train_features."
-#         )
-
-#     t_zero = max(30, int(time_limit * 0.25))
-#     t_reg = max(60, int(time_limit * 0.75))
-
-#     save_path = model_dir or DEFAULT_SAVE_PATH
-#     gpu_count = 1 if torch.cuda.is_available() else 0
-#     print(f"🚀 Training device: {'GPU (CUDA)' if gpu_count > 0 else 'CPU'}")
-
-#     # --- 2. FIT MODELS (2-STAGE) ---
-#     # Stage A: Zero Classifier
-#     zero_model_path = os.path.join(save_path, "zero_clf")
-
-#     df_zero = df_train.drop(columns=cols_to_drop_found, errors="ignore").copy()
-#     # ห้าม classifier เห็น label จริง + ห้ามใช้ wave_id
-#     df_zero = df_zero.drop(columns=[label, "wave_id"], errors="ignore")
-
-#     zero_clf = TabularPredictor(
-#         label="is_zero",
-#         path=zero_model_path,
-#         problem_type="binary",
-#         eval_metric="f1",
-#         verbosity=2,
-#     ).fit(
-#         train_data=df_zero,
-#         presets=presets,
-#         time_limit=t_zero,
-#         num_gpus=gpu_count,
-#     )
-
-#     # Stage B: Regressor (เฉพาะ wait>0)
-#     reg_model_path = os.path.join(save_path, "wait_reg")
-
-#     df_nonzero = df_train[df_train[label] > 0].copy()
-#     df_nonzero["wait_time_log"] = np.log1p(df_nonzero[label].astype(float))
-
-#     df_reg = df_nonzero.drop(columns=cols_to_drop_found, errors="ignore").copy()
-#     # regressor ไม่ให้เห็น wave_id / label เดิม / is_zero
-#     df_reg_for_fit = df_reg.drop(columns=["wave_id", label, "is_zero"], errors="ignore")
-
-#     predictor = TabularPredictor(
-#         label="wait_time_log",
-#         path=reg_model_path,
-#         problem_type="regression",
-#         eval_metric="mean_absolute_error",
-#         verbosity=2,
-#     ).fit(
-#         train_data=df_reg_for_fit,
-#         presets=presets,
-#         time_limit=t_reg,
-#         num_gpus=gpu_count,
-#     )
-
-#     # --- 3. MODEL ANALYSIS (คงโครงเดิม) ---
-#     print("\n" + "=" * 60)
-#     print("🔍 DEEP MODEL ANALYSIS & DIAGNOSIS")
-#     print("=" * 60)
-
-#     # A. Feature Importance (Regressor)
-#     print("\n[1] Calculating Feature Importance (Regressor)...")
-#     importance = predictor.feature_importance(df_reg_for_fit)
-#     print(importance.head(15))
-
-#     # B. Leaderboard (Regressor)
-#     print("\n[2] Model Leaderboard (Regressor):")
-#     leaderboard = predictor.leaderboard(df_reg_for_fit, silent=True)
-#     cols_lb = [c for c in ["model", "score_val", "pred_time_val", "fit_time"] if c in leaderboard.columns]
-#     print(leaderboard[cols_lb].head(5))
-
-#     # C. Residual Analysis (2-stage combine)  ✅ FIX จุดนี้
-#     X_test = df_train.drop(columns=[label])
-#     y_actual = df_train[label].astype(float)
-
-#     # เตรียม feature base (drop meta)
-#     X_feat = X_test.drop(columns=cols_to_drop_found, errors="ignore").copy()
-
-#     # ---- Stage A: predict proba zero ----
-#     X_zero_in = X_feat.drop(columns=["wave_id"], errors="ignore").copy()
-#     proba = zero_clf.predict_proba(X_zero_in)
-
-#     if hasattr(proba, "columns") and (1 in list(proba.columns)):
-#         proba_is_zero = proba[1].values
-#     else:
-#         proba_is_zero = np.array(proba)
-
-#     threshold = 0.5  # เริ่มจาก 0.45 ก่อน (ค่อยจูน)
-#     is_zero_pred = proba_is_zero >= threshold
-
-#     print("proba_is_zero min/mean/max =",
-#           float(np.min(proba_is_zero)), float(np.mean(proba_is_zero)), float(np.max(proba_is_zero)))
-#     print("predicted zeros =", int(is_zero_pred.sum()), "/", len(is_zero_pred))
-
-#     # ---- Stage B: predict wait (log -> ms) ----
-#     # ✅ FIX: drop แค่ wave_id + is_zero ให้ feature set ตรงกับตอนเทรน regressor
-#     X_reg_in = X_feat.drop(columns=["wave_id", "is_zero"], errors="ignore").copy()
-
-#     wait_log_pred = predictor.predict(X_reg_in)
-#     wait_pred = np.expm1(wait_log_pred.astype(float))
-#     wait_pred = np.clip(wait_pred, 0, None)
-
-#     # ---- Combine ----
-#     y_pred = np.where(is_zero_pred, 0.0, wait_pred)
-
-#     # Report dataframe
-#     out = df_train.copy()
-#     out["wave_id"] = wave_id_backup.iloc[df_train.index].values
-#     out["pred_wait_time_ms"] = y_pred
-#     out["error_ms"] = out["pred_wait_time_ms"] - y_actual
-#     out["abs_error_ms"] = out["error_ms"].abs()
-
-#     print("\n[3] TOP 10 WORST PREDICTIONS (Review these Wave IDs!):")
-#     cols_to_show = ["wave_id", label, "pred_wait_time_ms", "error_ms"]
-#     cols_to_show = [c for c in cols_to_show if c in out.columns]
-#     worst_10 = out.sort_values(by="abs_error_ms", ascending=False).head(10)
-#     print(worst_10[cols_to_show])
-
-#     # --- 4. SAVE DIAGNOSIS DATA (คงโครงเดิม) ---
-#     os.makedirs("data/processed/analysis", exist_ok=True)
-#     os.makedirs("data/processed/train", exist_ok=True)
-
-#     diag_path = f"data/processed/analysis/diagnosis_report_{ts}.csv"
-#     out.to_csv(diag_path, index=False)
-
-#     feat_imp_path = f"data/processed/analysis/feature_importance_{ts}.csv"
-#     importance.to_csv(feat_imp_path)
-
-#     train_out_path = f"data/processed/train/train_with_predictions_{ts}.csv"
-#     out.drop(columns=["abs_error_ms"], errors="ignore").to_csv(train_out_path, index=False)
-
-#     print(f"\n✅ Analysis Report Saved: {diag_path}")
-#     print(f"✅ Feature Importance Saved: {feat_imp_path}")
-#     print(f"✅ Models saved at: {save_path}")
-#     print(f"   - Zero classifier: {zero_model_path}")
-#     print(f"   - Wait regressor:  {reg_model_path}")
-#     print("=" * 60)
-
-# def predict(
-#     model_path: str,
-#     input_csv: str,
-#     out_csv: str = "predictions.csv",
-# ) -> None:
-#     if not os.path.exists(model_path):
-#         raise FileNotFoundError(f'Model not found at: "{model_path}"')
-
-#     zero_model_path = os.path.join(model_path, "zero_clf")
-#     reg_model_path = os.path.join(model_path, "wait_reg")
-#     if not os.path.exists(zero_model_path) or not os.path.exists(reg_model_path):
-#         raise FileNotFoundError(
-#             f"Expected sub-models not found.\n"
-#             f"Missing: {zero_model_path} or {reg_model_path}\n"
-#             f"Train must create both folders: zero_clf + wait_reg"
-#         )
-
-#     print(f"🔮 Loading models and predicting: {input_csv}")
-#     zero_clf = TabularPredictor.load(zero_model_path)
-#     wait_reg = TabularPredictor.load(reg_model_path)
-
-#     df = pd.read_csv(input_csv)
-
-#     # backup wave_id เพื่อแปะคืน
-#     wave_id_backup = df['wave_id'].copy() if 'wave_id' in df.columns else None
-
-#     # drop meta columns
-#     cols_to_drop_found = [c for c in COLS_TO_DROP if c in df.columns]
-#     df_feat = df.drop(columns=cols_to_drop_found, errors="ignore").copy()
-
-#     # Stage A: predict proba zero
-#     X_zero_in = df_feat.drop(columns=["wave_id"], errors="ignore").copy()
-#     proba = zero_clf.predict_proba(X_zero_in)
-#     if hasattr(proba, "columns") and (1 in list(proba.columns)):
-#         proba_is_zero = proba[1].values
-#     else:
-#         proba_is_zero = np.array(proba)
-
-#     threshold = 0.5
-#     is_zero_pred = proba_is_zero >= threshold
-
-#     print("proba_is_zero min/mean/max =", float(np.min(proba_is_zero)), float(np.mean(proba_is_zero)), float(np.max(proba_is_zero)))
-#     print("predicted zeros =", int(is_zero_pred.sum()), "/", len(is_zero_pred))
-
-#     # Stage B: regression (log -> ms)
-#     X_reg_in = df_feat.drop(columns=["wave_id", "is_zero", "wait_time_ms", "wait_time_log"], errors="ignore").copy()
-#     wait_log_pred = wait_reg.predict(X_reg_in)
-#     wait_pred = np.expm1(wait_log_pred.astype(float))
-#     wait_pred = np.clip(wait_pred, 0, None)
-
-#     final_pred = np.where(is_zero_pred, 0.0, wait_pred)
-
-#     # Output (คงโครงแบบเดิม: มี wave_id + pred)
-#     out = df_feat.copy()
-#     if wave_id_backup is not None:
-#         out["wave_id"] = wave_id_backup
-
-#     out["pred_wait_time_ms"] = final_pred
-
-#     # Reorder columns ให้ ID และผลทายอยู่หน้าสุดเพื่อให้ดูง่าย
-#     first_cols = [c for c in ["wave_id", "pred_wait_time_ms"] if c in out.columns]
-#     other_cols = [c for c in out.columns if c not in first_cols]
-#     out = out[first_cols + other_cols]
-
-#     os.makedirs(os.path.dirname(out_csv) or '.', exist_ok=True)
-#     out.to_csv(out_csv, index=False)
-#     print(f"✅ Prediction Results saved: {out_csv}")
-
-
-# def main():
-#     ap = argparse.ArgumentParser(description="AutoGluon Workflow with Analysis")
-#     ap.add_argument("--mode", default="train", choices=["train", "predict"])
-#     ap.add_argument("--data", default="data/processed/train/train_features.csv")
-#     ap.add_argument("--label", default="wait_time_ms")
-#     ap.add_argument("--model-path", default=None)  # สำหรับโหมด predict
-#     ap.add_argument("--inference-csv", default="data/processed/inference/features_test_2.csv")
-#     ap.add_argument("--out", default="data/processed/prediction/final_results.csv")
-#     ap.add_argument("--time-limit", type=int, default=120)  # เพิ่มเวลาเทรนเริ่มต้น
-#     ap.add_argument("--presets", default="medium_quality")
-
-#     args = ap.parse_args()
-
-#     try:
-#         if args.mode == "train":
-#             train(
-#                 data_path=args.data,
-#                 label=args.label,
-#                 presets=args.presets,
-#                 time_limit=args.time_limit,
-#             )
-#         else:
-#             if not args.model_path:
-#                 print("❌ Error: Please specify --model-path for prediction mode.")
-#                 return
-#             predict(
-#                 model_path=args.model_path,
-#                 input_csv=args.inference_csv,
-#                 out_csv=args.out,
-#             )
-#     except Exception as e:
-#         print(f"💥 ERROR: {e}")
-#         sys.exit(1)
-
-
-# if __name__ == "__main__":
-#     main()

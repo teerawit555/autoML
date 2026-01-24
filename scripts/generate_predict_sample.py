@@ -1,11 +1,14 @@
 # scripts/generate_predict_sample.py
+from __future__ import annotations
+
 import argparse
-from pathlib import Path
 import math
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
-# Import ตัวปกติ
+# ===== import ของ train (ใช้ noise / taper เหมือนเดิม) =====
 from generate_train_sample import (
     generate_step_response,
     generate_high_start_oscillation,
@@ -13,248 +16,382 @@ from generate_train_sample import (
     generate_low_swing_sine_wave,
     generate_overdamped_decay,
     generate_pulse_train,
-    generate_overdamped_decay1, # Type 4.1 (Overshoot)
+    generate_overdamped_decay1,
     apply_cosine_taper_settling,
     add_post_settle_noise,
-    add_time_delay
+    sample_target_mixed_units,  
 )
 
 # =============================================================================
-# HARD Generators (ปรับ Shape/Timing ให้โหดขึ้น)
+# CONFIG (รวมพารามิเตอร์ให้เรียบร้อย)
 # =============================================================================
 
-def generate_step_response_HARD(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
-    """ Type 0 HARD: Overshoot สูงปรี๊ด + สั่นนาน (Underdamped) """
-    freq_hz = float(rng.uniform(80, 1500))
-    w1 = 2.0 * np.pi * freq_hz
-    band_half = (limit_high - limit_low) / 2.0
+# --- time base ---
+DEFAULT_DT_MS = 0.01
+DEFAULT_T_END_MS = 9.9
 
-    overshoot_scale = float(rng.uniform(5.0, 20.0))  # Scale โหด
-    direction = float(rng.choice([1.0, -1.0]))
-    amp0 = band_half * overshoot_scale * direction
+# --- settle policy for pulse-like waves ---
+PULSE_SETTLE_S = 0.0001        # 0.1 ms (เหมือน train ที่บังคับ no_settle funcs)
+PULSE_START_AFTER_S = 0.0005   # 0.5 ms (ช่วงต้นยังไม่มี pulse)
+MAX_FIRST_PULSE_S = 0.002      # 2 ms (กันเว้นหน้าเยอะ)
 
-    tau = max(settling_time_s / float(rng.uniform(1.5, 3.5)), 1e-6) # หายช้า
-    time_constant_rise = max(settling_time_s / float(rng.uniform(3.0, 10.0)), 1e-6)
-    t_eff, _ = add_time_delay(time_vector, rng, max_delay_s=0.0008)
+# --- time delay jitter ---
+TINY_DELAY_MAX_SAMPLES = 2
 
-    base = target_value * (1.0 - np.exp(-t_eff / time_constant_rise))
-    ring = amp0 * np.exp(-t_eff / tau) * np.sin(w1 * t_eff)
-    y = base + ring
+# --- HARD slew realism ---
+SLEW_LIMIT_PROB = 0.5
+SLEW_T_LIMIT_S = 0.0015
 
-    y = apply_cosine_taper_settling(y, time_vector, settling_time_s, target_value, strength=0.85)
-    y, sd = add_post_settle_noise(y, time_vector, settling_time_s, target_value, rng, probability=0.9)
+
+# =============================================================================
+# Utility (predict only)
+# =============================================================================
+
+def soft_flatten_after_settle(y, t, settling_time_s, target, blend_window_s=0.0003):
+    """Blend เข้า target ก่อน settle และ hold target หลัง settle."""
+    if settling_time_s <= 0:
+        return y
+
+    N = len(y)
+    si = int(np.searchsorted(t, settling_time_s))
+    if si <= 1 or si >= N:
+        return y
+
+    t0 = max(settling_time_s - blend_window_s, 0.0)
+    i0 = int(np.searchsorted(t, t0))
+    i0 = max(0, min(i0, si))
+
+    w = np.linspace(0.0, 1.0, max(si - i0, 1))
+    y2 = y.copy()
+    y2[i0:si] = (1 - w) * y2[i0:si] + w * target
+    y2[si:] = target
+    return y2
+
+
+def tiny_time_delay(t, rng, max_samples=TINY_DELAY_MAX_SAMPLES):
+    """
+    Apply a very small time shift (measurement trigger jitter).
+    This MUST NOT modify y.
+    """
+    if len(t) < 2:
+        return t
+    dt = t[1] - t[0]
+    d = rng.uniform(0.0, max_samples * dt)
+    return np.clip(t - d, 0.0, None)
+
+
+def apply_slew_limit(y, dt, max_slope, t_limit_s):
+    """Apply slew-rate limit for the first t_limit_s seconds."""
+    if dt <= 0:
+        return y
+    max_step = max_slope * dt
+    max_idx = min(len(y), int(t_limit_s / dt))
+    y2 = y.copy()
+    for i in range(1, max_idx):
+        dy = y2[i] - y2[i - 1]
+        y2[i] = y2[i - 1] + np.clip(dy, -max_step, max_step)
+    return y2
+
+
+def pick_first_pulse_time(rng, t_end):
+    """
+    ให้ pulse แรกเกิดหลัง PULSE_START_AFTER_S
+    และไม่ช้ากว่า MAX_FIRST_PULSE_S
+    """
+    hi = min(MAX_FIRST_PULSE_S, t_end * 0.9)
+    lo = min(PULSE_START_AFTER_S, hi)
+    return float(rng.uniform(lo, hi))
+
+
+# =============================================================================
+# REALISTIC HARD generators
+# =============================================================================
+
+def generate_step_response_HARD(t, target, settle_s, low, high, rng):
+    """Step response but with more realistic zeta/bw + optional slew limiting."""
+    band = high - low
+    t_eff = tiny_time_delay(t, rng)
+
+    zeta = rng.uniform(0.15, 0.6)
+    n_cycles = rng.uniform(1.5, 4.5)
+    wd = 2 * np.pi * n_cycles / max(settle_s, 1e-6)
+    wn = wd / math.sqrt(max(1 - zeta**2, 1e-6))
+
+    sqrt_term = math.sqrt(max(1 - zeta**2, 1e-6))
+    y = target * (
+        1
+        - np.exp(-zeta * wn * t_eff)
+        * (np.cos(wd * t_eff) + (zeta / sqrt_term) * np.sin(wd * t_eff))
+    )
+
+    # initial condition offset
+    ic = band * rng.uniform(-0.7, 0.7)
+    y += ic * np.exp(-t_eff / (settle_s / rng.uniform(2.0, 6.0)))
+
+    # optional slew-rate limit
+    if rng.random() < SLEW_LIMIT_PROB:
+        max_slope = abs(band) * rng.uniform(3000, 12000)
+        dt = t[1] - t[0] if len(t) > 1 else 0.0
+        max_step = max_slope * dt
+        max_idx = min(len(y), int(0.001 / max(dt, 1e-12)))
+        for i in range(1, max_idx):
+            dy = y[i] - y[i - 1]
+            y[i] = y[i - 1] + np.clip(dy, -max_step, max_step)
+
+    y = apply_cosine_taper_settling(y, t, settle_s, target, rng.uniform(0.92, 0.99))
+    y = soft_flatten_after_settle(y, t, settle_s, target)
+
+    y, sd = add_post_settle_noise(y, t, settle_s, target, rng)
     return y, sd, "type0_HARD", 0.0, 0
 
-def generate_high_start_oscillation_HARD(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
-    """ Type 1 HARD: เริ่มสูงมาก + แกว่งลึก """
-    band = float(limit_high - limit_low)
-    num_cycles = int(rng.integers(3, 10))
-    t_eff, _ = add_time_delay(time_vector, rng, max_delay_s=0.0005)
 
-    freq = num_cycles / max(settling_time_s, 1e-6)
-    w = 2.0 * np.pi * freq
-    A = band * float(rng.uniform(4.0, 9.0)) # Amplitude โหด
+def generate_high_start_oscillation_HARD(t, target, settle_s, low, high, rng):
+    """Underdamped oscillation with realistic IC + optional slew."""
+    band = high - low
+    t_eff = tiny_time_delay(t, rng)
 
-    bias_amp = band * float(rng.uniform(-1.5, 1.5))
-    bias_tau = max(settling_time_s / float(rng.uniform(1.0, 2.5)), 1e-6)
-    bias = bias_amp * np.exp(-t_eff / bias_tau)
-    env = np.exp(-t_eff / (settling_time_s * 1.5)) # หายช้ามาก
+    zeta = rng.uniform(0.12, 0.55)
+    n_cycles = rng.uniform(2.0, 5.0)
+    wd = 2 * np.pi * n_cycles / max(settle_s, 1e-6)
+    wn = wd / math.sqrt(max(1 - zeta**2, 1e-6))
 
-    osc = A * env * np.cos(w * t_eff)
-    y = target_value + bias + osc
+    sqrt_term = math.sqrt(max(1 - zeta**2, 1e-6))
+    y = target * (
+        1
+        - np.exp(-zeta * wn * t_eff)
+        * (np.cos(wd * t_eff) + (zeta / sqrt_term) * np.sin(wd * t_eff))
+    )
 
-    y = apply_cosine_taper_settling(y, time_vector, settling_time_s, target_value, strength=0.9)
-    y, sd = add_post_settle_noise(y, time_vector, settling_time_s, target_value, rng)
+    ic = band * rng.uniform(-1.0, 1.0)
+    y += ic * np.exp(-t_eff / (settle_s / rng.uniform(1.8, 4.5)))
+
+    if rng.random() < 0.6 and len(t) > 1:
+        dt = t[1] - t[0]
+        max_slope = abs(band) * rng.uniform(2500, 10000)
+        y = apply_slew_limit(y, dt, max_slope, t_limit_s=SLEW_T_LIMIT_S)
+
+    y = apply_cosine_taper_settling(y, t, settle_s, target, rng.uniform(0.92, 0.99))
+    y = soft_flatten_after_settle(y, t, settle_s, target)
+
+    y, sd = add_post_settle_noise(y, t, settle_s, target, rng)
     return y, sd, "type1_HARD", 0.0, 0
 
-def generate_continuous_triangular_pulses_HARD(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
-    """ Type 2 HARD: สามเหลี่ยมเบี้ยว (Sawtooth) + Jitter ระยะห่างเยอะ """
-    y = np.full_like(time_vector, target_value, dtype=float)
-    avg_height = (limit_high - limit_low) * float(rng.uniform(1.0, 3.0)) # สูงกว่าปกติ
-    avg_period = float(rng.uniform(settling_time_s / 4.0, settling_time_s / 1.2))
-    
-    current_time = float(rng.uniform(0.0, avg_period * 0.3))
-    
-    while current_time < float(time_vector[-1]):
-        # Hard: ความสูงเปลี่ยนไปมาเยอะ
-        height = avg_height * float(rng.uniform(0.3, 1.8))
-        
-        # Hard: Pulse Width ไม่คงที่
-        pulse_width = avg_period * float(rng.uniform(0.1, 0.4))
-        
-        # Hard: Skew (เบี้ยวซ้าย/ขวา)
-        skew = float(rng.uniform(0.1, 0.9)) # 0.5 = สมมาตร, <0.5 เบี้ยวซ้าย, >0.5 เบี้ยวขวา
-        t_peak_rel = pulse_width * skew
 
-        t_start = current_time
-        t_peak = t_start + t_peak_rel
-        t_end = t_start + pulse_width
+def generate_overdamped_decay_HARD(t, target, settle_s, low, high, rng):
+    """Overdamped but multi-time-constant (RC ladder / bias network)."""
+    band = high - low
+    t_eff = tiny_time_delay(t, rng)
 
-        # Rise
-        rise = (time_vector >= t_start) & (time_vector < t_peak)
-        if np.any(rise):
-            y[rise] += (height / max(t_peak_rel, 1e-9)) * (time_vector[rise] - t_start)
-        
-        # Fall
-        fall = (time_vector >= t_peak) & (time_vector < t_end)
-        if np.any(fall):
-            y[fall] += height - (height / max(pulse_width - t_peak_rel, 1e-9)) * (time_vector[fall] - t_peak)
+    a1 = band * rng.uniform(-2.0, 2.0)
+    a2 = band * rng.uniform(-1.5, 1.5)
+    tau1 = rng.uniform(0.0002, 0.0015)
+    tau2 = rng.uniform(0.001, 0.008)
 
-        # Hard: Period Jitter เยอะๆ
-        period = avg_period * float(rng.uniform(0.5, 1.8))
-        current_time += period
+    y = target + a1 * np.exp(-t_eff / tau1) + a2 * np.exp(-t_eff / tau2)
 
-    sd = max(target_value * 0.0005, 1e-6)
-    y += rng.normal(0.0, sd, size=len(y))
+    y = apply_cosine_taper_settling(y, t, settle_s, target, rng.uniform(0.92, 0.99))
+    y = soft_flatten_after_settle(y, t, settle_s, target)
+
+    y, sd = add_post_settle_noise(y, t, settle_s, target, rng)
+    return y, sd, "type4_HARD", settle_s * 1000.0, 0
+
+
+def generate_continuous_triangular_pulses_HARD(t, target, settle_s, low, high, rng):
+    """
+    Triangle pulse train (hard)
+    ✅ บังคับให้ช่วงต้นยังไม่มี pulse: first pulse >= 0.5ms
+    ✅ กันเว้นหน้าเยอะ: first pulse <= 2ms
+    """
+    y = np.full_like(t, target)
+    band = high - low
+    t_end = float(t[-1])
+
+    period = float(rng.uniform(t_end / 6, t_end / 2.5))
+    cur = pick_first_pulse_time(rng, t_end)  # ✅
+
+    while cur < t_end:
+        p = period * float(rng.uniform(0.8, 1.3))
+        h = band * float(rng.uniform(0.5, 1.6))
+        w = p * float(rng.uniform(0.15, 0.35))
+
+        r = (t >= cur) & (t < cur + w / 2)
+        f = (t >= cur + w / 2) & (t < cur + w)
+
+        if np.any(r):
+            y[r] += h * (t[r] - cur) / (w / 2)
+        if np.any(f):
+            y[f] += h * (1 - (t[f] - (cur + w / 2)) / (w / 2))
+
+        cur += p
+
+    y, sd = add_post_settle_noise(y, t, 0.0, target, rng, probability=0.0, add_wobble_prob=0.0)
     return y, sd, "type2_HARD", 0.0, 1
 
-def generate_overdamped_decay_HARD(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
-    """ Type 4 HARD: ลงช้ามากๆ (Super Slow Tail) """
-    # Hard: เริ่มสูงมาก
-    start_amp = (limit_high - limit_low) * float(rng.uniform(3.0, 6.0))
-    
-    # Hard: Tau ยาวกว่า Settling time (ทำให้ลงไม่สุด หรือลงช้ามาก)
-    tau = settling_time_s * float(rng.uniform(0.8, 1.5)) 
 
-    y = target_value + start_amp * np.exp(-time_vector / max(tau, 1e-12))
-    
-    # Taper น้อยๆ เพื่อปล่อยให้หางยาวๆ โผล่มา
-    y = apply_cosine_taper_settling(y, time_vector, settling_time_s, target_value, strength=0.5)
-    y, sd = add_post_settle_noise(y, time_vector, settling_time_s, target_value, rng)
-    return y, sd, "type4_HARD", float(settling_time_s * 1000.0), 0
+def generate_pulse_train_HARD(t, target, settle_s, low, high, rng):
+    """
+    Square pulse train (hard)
+    ✅ บังคับให้ช่วงต้นยังไม่มี pulse: first pulse >= 0.5ms
+    ✅ กันเว้นหน้าเยอะ: first pulse <= 2ms
+    """
+    y = np.full_like(t, target)
+    band = high - low
+    t_end = float(t[-1])
 
-def generate_pulse_train_HARD(time_vector, target_value, settling_time_s, limit_low, limit_high, rng):
-    """ Type 5 HARD: Pulse ผอม/อ้วนสลับกัน + Missing Pulse """
-    y = np.full_like(time_vector, target_value, dtype=float)
-    band = float(limit_high - limit_low)
-    base_amp = band * float(rng.uniform(0.8, 2.5))
+    period = float(rng.uniform(t_end / 6, t_end / 2.2))
+    cur = pick_first_pulse_time(rng, t_end)  # ✅
 
-    t_end = float(time_vector[-1])
-    period = float(rng.uniform(t_end / 6.0, t_end / 3.0))
-    current_time = float(rng.uniform(0.0, period * 0.5))
+    while cur < t_end:
+        p = period * float(rng.uniform(0.7, 1.4))
+        w = p * float(rng.uniform(0.08, 0.25))
+        amp = band * float(rng.uniform(0.3, 2.0)) * (1 if rng.random() > 0.15 else -1)
 
-    while current_time < t_end:
-        # Hard: Pulse Width Swing เยอะๆ (บางอันผอมเป็นเข็ม บางอันอ้วน)
-        duty = float(rng.uniform(0.02, 0.40)) 
-        width = max(period * duty, 1e-6)
+        mask = (t >= cur) & (t < cur + w)
+        if np.any(mask):
+            y[mask] += amp
+        cur += p
 
-        # Hard: โอกาสที่ Pulse จะหายไป (Missing Pulse)
-        if rng.random() > 0.15: 
-            t_start = current_time
-            t_stop = min(current_time + width, t_end)
-            mask = (time_vector >= t_start) & (time_vector < t_stop)
-            
-            # Hard: Amplitude เปลี่ยนทุก Pulse แบบกระชาก
-            this_amp = base_amp * float(rng.uniform(0.5, 2.0))
-            y[mask] += this_amp
-
-        # Hard: ระยะห่างแต่ละ Pulse ไม่เท่ากัน
-        current_time += period * float(rng.uniform(0.6, 1.6))
-
-    y, sd = add_post_settle_noise(y, time_vector, 0.0, target_value, rng, probability=0.0)
+    y, sd = add_post_settle_noise(y, t, 0.0, target, rng, probability=0.0, add_wobble_prob=0.0)
     return y, sd, "type5_HARD", 0.0, 1
 
+
 # =============================================================================
-# Main Logic
+# main helpers
 # =============================================================================
 
-def build_generation_plan(n_waves: int, ratios, rng: np.random.Generator):
+def build_generation_plan(n, ratios, rng):
     plan = []
-    allocated = 0
-    for func, r in ratios:
-        cnt = int(n_waves * float(r))
-        plan.extend([func] * cnt)
-        allocated += cnt
-    
-    remainder = n_waves - allocated
-    if remainder > 0:
-        plan.extend([ratios[0][0]] * remainder)
-        
+    for f, r in ratios:
+        plan += [f] * int(n * r)
+    while len(plan) < n:
+        plan.append(ratios[0][0])
     rng.shuffle(plan)
     return plan
 
+
+def sample_settle_time_caseA(rng, t_end_ms):
+    """สุ่ม settle time แบบเดิมสำหรับพวกที่ต้อง settle จริง ๆ"""
+    max_s = 0.75 * t_end_ms
+    p = rng.random()
+    if p < 0.78:
+        return rng.uniform(1.5, 0.55 * max_s)
+    elif p < 0.96:
+        return rng.uniform(0.55 * max_s, 0.85 * max_s)
+    else:
+        return rng.uniform(0.85 * max_s, max_s)
+
+
+def call_gen(func, *args):
+    out = func(*args)
+    if len(out) == 5:
+        return out
+    if len(out) == 3:
+        y, sd, name = out
+        return y, sd, name, 0.0, 0
+    raise RuntimeError(f"{func.__name__} bad return")
+
+
+# =============================================================================
+# main
+# =============================================================================
+
 def main():
-    ap = argparse.ArgumentParser(description="Generate PREDICT data (Normal + HARD modes).")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data/raw/data_predict.csv")
     ap.add_argument("--n_waves", type=int, default=200)
-    ap.add_argument("--dt_ms", type=float, default=0.01)
-    ap.add_argument("--t_end_ms", type=float, default=9.9)
-    ap.add_argument("--predict_noise_scale", type=float, default=1.0)
+    ap.add_argument("--dt_ms", type=float, default=DEFAULT_DT_MS)
+    ap.add_argument("--t_end_ms", type=float, default=DEFAULT_T_END_MS)
+    ap.add_argument("--seed", type=int, default=20251111)
     args = ap.parse_args()
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
     t_ms = np.arange(0.0, args.t_end_ms + 1e-12, args.dt_ms)
-    t_s = t_ms / 1000.0
+    t = t_ms / 1000.0
 
-    # แบ่งสัดส่วน Normal vs Hard (รวมๆ กันให้ได้ 1.0)
     ratios = [
-        # Type 0: Step
-        (generate_step_response,        0.14),
-        (generate_step_response_HARD,   0.14),
-        
-        # Type 1: Oscillation
-        (generate_high_start_oscillation,      0.12),
-        (generate_high_start_oscillation_HARD, 0.12),
-
-        # Type 2: Triangle
-        (generate_continuous_triangular_pulses,      0.05),
+        (generate_step_response, 0.12),
+        (generate_step_response_HARD, 0.12),
+        (generate_high_start_oscillation, 0.10),
+        (generate_high_start_oscillation_HARD, 0.10),
+        (generate_continuous_triangular_pulses, 0.05),
         (generate_continuous_triangular_pulses_HARD, 0.05),
-
-        # Type 3: Sine
-        (generate_low_swing_sine_wave,      0.04),
-
-        # Type 4: Overdamped (รวม 4.1 ด้วย)
-        (generate_overdamped_decay,       0.05),
-        (generate_overdamped_decay_HARD,  0.05),
-        (generate_overdamped_decay1,      0.10), # Type 4.1 ใช้ตัวเดิม (เพราะมัน overshoot อยู่แล้ว)
-
-        # Type 5: Pulse Train
-        (generate_pulse_train,       0.05),
-        (generate_pulse_train_HARD,  0.05),
+        (generate_low_swing_sine_wave, 0.04),
+        (generate_overdamped_decay, 0.05),
+        (generate_overdamped_decay_HARD, 0.05),
+        (generate_overdamped_decay1, 0.12),
+        (generate_pulse_train, 0.06),
+        (generate_pulse_train_HARD, 0.06),
     ]
 
-    master_rng = np.random.default_rng(20251111) 
-    gen_sequence = build_generation_plan(args.n_waves, ratios, master_rng)
+    pulse_funcs = {
+        generate_continuous_triangular_pulses,
+        generate_continuous_triangular_pulses_HARD,
+        generate_pulse_train,
+        generate_pulse_train_HARD,
+    }
+
+    rng = np.random.default_rng(args.seed)
+    plan = build_generation_plan(args.n_waves, ratios, rng)
 
     rows = []
-    print(f"Generating MIXED (Normal + HARD) PREDICT dataset ({args.n_waves} waves)...")
+    for wid, gen in enumerate(plan, start=1):
 
-    for wave_id, gen_func in enumerate(gen_sequence, start=1):
-        final_value = float(master_rng.uniform(0.5, 3.5))
-        band_pct = float(master_rng.uniform(0.05, 0.15))
-        band = final_value * band_pct
-        low = final_value - band / 2.0
-        high = final_value + band / 2.0
-        
-        settle_time_ms = float(master_rng.uniform(2.0, 8.0))
-        settle_s = settle_time_ms / 1000.0
+        # ✅ target มี ns/us ตาม train
+        target = float(sample_target_mixed_units(rng))
 
-        wave_rng = np.random.default_rng(700000 + wave_id)
+        # ✅ band ไม่มี floor 0.2 (ใช้ floor ตาม magnitude)
+        mag = max(abs(target), 1e-12)
+        band_pct = float(rng.uniform(0.05, 0.15))
+        band_floor = mag * 0.02
+        band = float(max(mag * band_pct, band_floor))
+        low, high = target - band / 2.0, target + band / 2.0
 
-        y, used_sd, type_name, _, _ = gen_func(
-           t_s, final_value, settle_s, low, high, wave_rng
-        )
+        # ✅ settle: พวกที่ต้อง settle สุ่มตามเดิม
+        settle_ms = float(sample_settle_time_caseA(rng, args.t_end_ms))
+        settle_s = settle_ms / 1000.0
 
-        # Add Noise
-        extra_rng = np.random.default_rng(900000 + wave_id)
-        extra_sd = max(float(used_sd) * args.predict_noise_scale, 1e-6)
-        y = y + extra_rng.normal(0.0, extra_sd, size=len(y))
+        # ✅ pulse types: ไม่มี settle จริง
+        if gen in pulse_funcs:
+            settle_s = PULSE_SETTLE_S
 
-        for i, (tm, val) in enumerate(zip(t_ms, y)):
+        wave_rng = np.random.default_rng(700000 + wid)
+        y, sd, name, _, _ = call_gen(gen, t, target, settle_s, low, high, wave_rng)
+
+        # ----------------------------
+        # low/high จากช่วง "หลัง settle" จริง
+        # ----------------------------
+        si = int(np.searchsorted(t, settle_s)) if settle_s > 0 else 0
+        si = max(0, min(si, len(y) - 1))
+
+        post = y[si:] if si < len(y) else y[-1:]
+        if len(post) < 5:
+            post = y
+
+        low_settle = float(np.min(post))
+        high_settle = float(np.max(post))
+
+        for i in range(len(t)):
             rows.append({
-                "wave_id": wave_id,
-                "sample": i,
-                "time_ms": float(tm),
-                "value": float(val),
-                "low_limit": float(low),
-                "high_limit": float(high),
+                "wave_id": wid,
+                "sample": int(i),
+                "time_ms": float(t_ms[i]),
+                "value": float(y[i]),
+                "sd": float(sd),
+                "low_limit": low_settle,
+                "high_limit": high_settle,
+                "type": str(name),
             })
 
     df = pd.DataFrame(rows)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_path, index=False)
-    print(f"Saved MIXED PREDICT data to: {out_path}")
+
+    print(f"✅ Saved realistic PREDICT data to: {out_path}")
+    print(f"Config: PULSE_SETTLE_S={PULSE_SETTLE_S*1000:.3f}ms, "
+          f"PULSE_START_AFTER_S={PULSE_START_AFTER_S*1000:.3f}ms, "
+          f"MAX_FIRST_PULSE_S={MAX_FIRST_PULSE_S*1000:.3f}ms")
+
+
 
 if __name__ == "__main__":
     main()

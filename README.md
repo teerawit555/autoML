@@ -50,20 +50,20 @@ python scripts\generate_predict_sample.py --out data\raw\data_for_pred.csv --dt_
 ### 2. Transform Long data to Wide format
 #### 2.1 Data for training (with labels) 
 ```powershell
-python scripts/make_wide_csv.py --mode train --in data/raw/data_for_train.csv --out data/processed/train/train_features.csv
+python scripts/extract_features.py --mode train --in data/raw/data_for_train.csv --out data/processed/train/train_features.csv
 ```
 #### 2.2 Data for inference (without labels) 
 ```powershell
-python scripts/make_wide_csv.py --mode inference --in data/raw/data_for_train.csv --out data\processed\inference\wide.csv
+python scripts/extract_features.py --mode inference --in data/raw/data_for_pred.csv --out data\processed\inference\pred_features.csv
 ```
 ### 3. Train the AutoML model
 ```powershell
-python scripts\autoML.py --mode train --data data\processed\train\train_features.csv --label wait_time_ms --time-limit 120
+python scripts\train_ag_TT.py --mode train --data data\processed\train\train_features.csv --label wait_time_ms --time-limit 120
 ```
 
 ### 4. Run Prediction (Inference)
 ```powershell
-python scripts\autoML.py --mode predict --model-path AutogluonModels/ag-20260106_202316 --inference-csv data\processed\inference\wide.csv --out data\processed\prediction\predicted_wait_time.csv
+python scripts\autoML.py --mode predict --model-path AutogluonModels/ag-20260129_142046 --inference-csv data\processed\inference\pred_features.csv --out data\processed\prediction\predicted_wait_time.csv
 ```
 
 ### 5. Generate Visualization plots
@@ -71,11 +71,14 @@ python scripts\autoML.py --mode predict --model-path AutogluonModels/ag-20260106
 #### Debugging plot waveform
 ```powershell
 # Check waveform data for train
-python scripts/plot_all_waves.py --mode check_train --raw data/raw/data_for_train.csv --result data/processed/train/train_with_predictions_20260106_202316.csv --out plots/Vxx/check.png
+python scripts/check_plot_v22.py --mode check_train --raw data\raw\data_for_train.csv --result data\processed\train\train_features_V_TT.csv --out plots/V_xx/train_scale.png     
 # Check waveform data for pred
-python scripts/plot_all_waves.py --mode check_pred --raw data\raw\data_for_pred.csv --result data/processed/prediction/predicted_wait_time.csv --out plots/Vxx/check.png
+python scripts/check_plot_v22.py --mode check_pred --raw data\raw\data_for_pred.csv --result data/processed/prediction/pred_wait_time.csv --out plots/V_xx/check.png       
 ```
-
+### 6. audit features
+```powershell
+python scripts/audit_features.py --train data/processed/train/train_features_V_TT.csv --pred data/processed/inference/wide_v_TT.csv --outdir AutogluonModels/ag-v27-20260129_142046/feature_audit --min-unique 10 --corr-thr 0.95
+```
 ## AutoML Architecture (autoML.py)
 The machine learning pipeline implements a Two-Stage Hybrid Model designed to handle the specific nature of waveform settling times (sparse non-zero values and specific signal patterns).
 

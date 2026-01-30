@@ -377,9 +377,11 @@ def predict(
     wait_pred = np.expm1(np.asarray(wait_log_pred, dtype=float))
     wait_pred = np.clip(wait_pred, 0, None)
 
-    # ถ้า Model ทายว่าเป็น Zero Class (0.0) ให้ปัดเป็น 0.1 (Default)
-    final_pred = np.where(is_zero_pred, 0.1, wait_pred)
-    final_pred = np.maximum(final_pred, 0.1)
+    # ----------------------
+    #  AI decision (allow 0.0 internally)
+    # ----------------------
+    ai_pred = np.where(is_zero_pred, 0.0, wait_pred)
+    ai_pred = np.clip(ai_pred, 0.0, None)   # กันค่าติดลบหลุดมา
 
     # ======================================================
     # HYBRID LOGIC OVERRIDE
@@ -388,19 +390,32 @@ def predict(
     # Sine/Pulse หรือ Glitch ที่ Logic จับได้ จะถูกบังคับเป็น 0.0ms ทันที
 
     if "logic_flag_continuous" in df.columns:
-        mask_cont = df["logic_flag_continuous"] == 1
+        mask_cont = df["logic_flag_continuous"] >= 1  # เปลี่ยนเป็น >= 1 เผื่อไว้
         count_cont = mask_cont.sum()
         if count_cont > 0:
             print(f"⚡ Applying Logic Override for Continuous Waves: {count_cont} items forced to 0.0ms")
-            final_pred[mask_cont] = 0.0
+            ai_pred[mask_cont] = 0.0
 
+    # ... (ส่วน Glitch ต้องแก้!)
     if "logic_flag_glitch" in df.columns:
-        mask_glitch = df["logic_flag_glitch"] == 1
+        # ❌ ของเดิม: mask_glitch = df["logic_flag_glitch"] == 1 
+        # ✅ ของใหม่: ใช้ >= 1 เพื่อเก็บ Type 1, 2, 3 ให้หมด
+        mask_glitch = df["logic_flag_glitch"] >= 1 
+        
         count_glitch = mask_glitch.sum()
         if count_glitch > 0:
             print(f"⚡ Applying Logic Override for Glitch: {count_glitch} items forced to 0.0ms")
-            final_pred[mask_glitch] = 0.0
+            ai_pred[mask_glitch] = 0.0
+
     # ======================================================
+
+    # ----------------------
+    # Final display constraint: 0.0ms -> 0.1ms (100us)
+    # ----------------------
+    eps = 1e-12  # กัน float error
+    final_pred = np.where(np.abs(ai_pred) <= eps, 0.1, ai_pred)
+    final_pred = np.maximum(final_pred, 0.1)
+
 
     # Output (คงโครง: wave_id + pred ก่อน)
     out = df_feat.copy()

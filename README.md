@@ -63,7 +63,7 @@ python scripts\train_ag_TT.py --mode train --data data\processed\train\train_fea
 
 ### 4. Run Prediction (Inference)
 ```powershell
-python scripts\autoML.py --mode predict --model-path AutogluonModels/ag-20260129_142046 --inference-csv data\processed\inference\pred_features.csv --out data\processed\prediction\predicted_wait_time.csv
+python scripts\predict_ag_TT.py --mode predict --model-path AutogluonModels/ag-20260129_142046 --inference-csv data\processed\inference\pred_features.csv --out data\processed\prediction\predicted_wait_time.csv
 ```
 
 ### 5. Generate Visualization plots

@@ -58,7 +58,7 @@ python scripts/extract_features.py --mode inference --in data/raw/data_for_pred.
 ```
 ### 3. Train the AutoML model
 ```powershell
-python scripts\train_ag_TT.py --mode train --data data\processed\train\train_features.csv --label wait_time_ms --time-limit 120
+python scripts\train_ag_TT_split.py --mode train --data data\processed\train\train_features.csv --label wait_time_ms --time-limit 120
 ```
 
 ### 4. Run Prediction (Inference)
